@@ -1,6 +1,6 @@
 {
   "name": "@parcel/kitchen-sink-example",
-  "version": "2.0.0-rc.0",
+  "version": "2.13.3",
   "license": "MIT",
   "private": true,
   "scripts": {
@@ -8,16 +8,17 @@
     "build": "rm -rf dist && parcel build src/index.html --no-cache"
   },
   "devDependencies": {
-    "@parcel/babel-register": "2.0.0-rc.0",
-    "@parcel/config-default": "2.0.0-rc.0",
-    "@parcel/optimizer-esbuild": "2.0.0-rc.0",
-    "@parcel/reporter-sourcemap-visualiser": "2.0.0-rc.0",
-    "parcel": "2.0.0-rc.0"
+    "@babel/core": "^7.22.11",
+    "@parcel/babel-register": "2.13.3",
+    "@parcel/config-default": "2.13.3",
+    "@parcel/core": "2.13.3",
+    "@parcel/optimizer-esbuild": "2.13.3",
+    "@parcel/reporter-sourcemap-visualiser": "2.13.3",
+    "parcel": "2.13.3"
   },
-  "browser": "dist/legacy/index.html",
-  "browserModern": "dist/modern/index.html",
   "targets": {
     "browserModern": {
+      "distDir": "dist/modern",
       "engines": {
         "browsers": [
           "last 1 Chrome version"
@@ -25,6 +26,7 @@
       }
     },
     "browser": {
+      "distDir": "dist/legacy",
       "engines": {
         "browsers": [
           "> 0.25%"
@@ -34,7 +36,7 @@
   },
   "dependencies": {
     "lodash": "^4.17.11",
-    "react": "^16.6.3",
-    "react-dom": "^16.6.3"
+    "react": "^19",
+    "react-dom": "^19"
   }
 }

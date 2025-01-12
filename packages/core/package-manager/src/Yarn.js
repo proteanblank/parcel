@@ -1,6 +1,6 @@
 // @flow strict-local
 
-import type {PackageInstaller, InstallerOptions} from './types';
+import type {PackageInstaller, InstallerOptions} from '@parcel/types';
 
 import commandExists from 'command-exists';
 import spawn from 'cross-spawn';
@@ -9,7 +9,7 @@ import split from 'split2';
 import JSONParseStream from './JSONParseStream';
 import promiseFromProcess from './promiseFromProcess';
 import {registerSerializableClass} from '@parcel/core';
-import {npmSpecifierFromModuleRequest} from './utils';
+import {exec, npmSpecifierFromModuleRequest} from './utils';
 
 // $FlowFixMe
 import pkg from '../package.json';
@@ -35,6 +35,8 @@ type YarnStdErrMessage = {|
 |};
 
 let hasYarn: ?boolean;
+let yarnVersion: ?number;
+
 export class Yarn implements PackageInstaller {
   static async exists(): Promise<boolean> {
     if (hasYarn != null) {
@@ -55,12 +57,20 @@ export class Yarn implements PackageInstaller {
     cwd,
     saveDev = true,
   }: InstallerOptions): Promise<void> {
+    if (yarnVersion == null) {
+      let version = await exec('yarn --version');
+      yarnVersion = parseInt(version.stdout, 10);
+    }
+
     let args = ['add', '--json'].concat(
       modules.map(npmSpecifierFromModuleRequest),
     );
 
     if (saveDev) {
-      args.push('-D', '-W');
+      args.push('-D');
+      if (yarnVersion < 2) {
+        args.push('-W');
+      }
     }
 
     // When Parcel is run by Yarn (e.g. via package.json scripts), several environment variables are

@@ -1,9 +1,9 @@
 import assert from 'assert';
-import {bundle, assertBundles, outputFS, distDir} from '@parcel/test-utils';
+import {assertBundles, bundle, distDir, outputFS} from '@parcel/test-utils';
 import path from 'path';
 
-describe('sugarss', function() {
-  it('should correctly parse SugarSS asset', async function() {
+describe('sugarss', function () {
+  it('should correctly parse SugarSS asset', async function () {
     let b = await bundle(
       path.join(__dirname, '/integration/sugarss/index.sss'),
     );

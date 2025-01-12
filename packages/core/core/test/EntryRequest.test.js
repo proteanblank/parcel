@@ -1,6 +1,7 @@
 // @flow strict-local
 import assert from 'assert';
 import path from 'path';
+import {md} from '@parcel/diagnostic';
 import {inputFS as fs} from '@parcel/test-utils';
 import {EntryResolver} from '../src/requests/EntryRequest';
 import {DEFAULT_OPTIONS as _DEFAULT_OPTIONS} from './test-utils';
@@ -33,10 +34,15 @@ const INVALID_TARGET_SOURCE_NOT_FILE_FIXTURE_PATH = path.join(
   'fixtures/invalid-target-source-not-file',
 );
 
-describe('EntryResolver', function() {
+const GLOB_LIKE_FIXTURE_PATH = path.join(
+  __dirname,
+  'fixtures/glob-like/[entry].js',
+);
+
+describe('EntryResolver', function () {
   let entryResolver = new EntryResolver({...DEFAULT_OPTIONS});
 
-  it('rejects missing source in package.json', async function() {
+  it('rejects missing source in package.json', async function () {
     this.timeout(10000);
     // $FlowFixMe assert.rejects is Node 10+
     await assert.rejects(
@@ -45,7 +51,7 @@ describe('EntryResolver', function() {
         diagnostics: [
           {
             origin: '@parcel/core',
-            message: `${path.join(
+            message: md`${path.join(
               path.relative(fs.cwd(), INVALID_SOURCE_MISSING_FIXTURE_PATH),
               'missing.js',
             )} does not exist.`,
@@ -76,7 +82,7 @@ describe('EntryResolver', function() {
       },
     );
   });
-  it('rejects non-file source in package.json', async function() {
+  it('rejects non-file source in package.json', async function () {
     this.timeout(10000);
     // $FlowFixMe assert.rejects is Node 10+
     await assert.rejects(
@@ -85,7 +91,7 @@ describe('EntryResolver', function() {
         diagnostics: [
           {
             origin: '@parcel/core',
-            message: `${path.join(
+            message: md`${path.join(
               path.relative(fs.cwd(), INVALID_SOURCE_NOT_FILE_FIXTURE_PATH),
               'src',
             )} is not a file.`,
@@ -115,7 +121,7 @@ describe('EntryResolver', function() {
       },
     );
   });
-  it('rejects missing target source in package.json', async function() {
+  it('rejects missing target source in package.json', async function () {
     this.timeout(10000);
     // $FlowFixMe assert.rejects is Node 10+
     await assert.rejects(
@@ -125,7 +131,7 @@ describe('EntryResolver', function() {
         diagnostics: [
           {
             origin: '@parcel/core',
-            message: `${path.join(
+            message: md`${path.join(
               path.relative(
                 fs.cwd(),
                 INVALID_TARGET_SOURCE_MISSING_FIXTURE_PATH,
@@ -159,7 +165,7 @@ describe('EntryResolver', function() {
       },
     );
   });
-  it('rejects non-file target source in package.json', async function() {
+  it('rejects non-file target source in package.json', async function () {
     this.timeout(10000);
     // $FlowFixMe assert.rejects is Node 10+
     await assert.rejects(
@@ -169,7 +175,7 @@ describe('EntryResolver', function() {
         diagnostics: [
           {
             origin: '@parcel/core',
-            message: `${path.join(
+            message: md`${path.join(
               path.relative(
                 fs.cwd(),
                 INVALID_TARGET_SOURCE_NOT_FILE_FIXTURE_PATH,
@@ -201,5 +207,9 @@ describe('EntryResolver', function() {
         ],
       },
     );
+  });
+  it('does not time out on glob-like entry', async function () {
+    this.timeout(10000);
+    await entryResolver.resolveEntry(GLOB_LIKE_FIXTURE_PATH);
   });
 });

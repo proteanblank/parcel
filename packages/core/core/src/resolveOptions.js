@@ -4,19 +4,29 @@ import type {
   FilePath,
   InitialParcelOptions,
   DependencySpecifier,
+  InitialServerOptions,
 } from '@parcel/types';
 import type {FileSystem} from '@parcel/fs';
 import type {ParcelOptions} from './types';
 
 import path from 'path';
-import {hashString} from '@parcel/hash';
+import {hashString} from '@parcel/rust';
 import {NodeFS} from '@parcel/fs';
 import {LMDBCache, FSCache} from '@parcel/cache';
 import {NodePackageManager} from '@parcel/package-manager';
-import {getRootDir, relativePath, resolveConfig} from '@parcel/utils';
+import {
+  getRootDir,
+  relativePath,
+  resolveConfig,
+  isGlob,
+  globToRegex,
+} from '@parcel/utils';
 import loadDotEnv from './loadDotEnv';
 import {toProjectPath} from './projectPath';
 import {getResolveFrom} from './requests/ParcelConfigRequest';
+
+import {DEFAULT_FEATURE_FLAGS} from '@parcel/feature-flags';
+import {PARCEL_VERSION} from './constants';
 
 // Default cache directory name
 const DEFAULT_CACHE_DIRNAME = '.parcel-cache';
@@ -27,6 +37,11 @@ function generateInstanceId(entries: Array<FilePath>): string {
   return hashString(
     `${entries.join(',')}-${Date.now()}-${Math.round(Math.random() * 100)}`,
   );
+}
+
+// Compiles an array of globs to regex - used for lazy include/excludes
+function compileGlobs(globs: string[]): RegExp[] {
+  return globs.map(glob => globToRegex(glob));
 }
 
 export default async function resolveOptions(
@@ -49,7 +64,21 @@ export default async function resolveOptions(
     entries = [path.resolve(inputCwd, initialOptions.entries)];
   }
 
-  let entryRoot = getRootDir(entries);
+  let shouldMakeEntryReferFolder = false;
+  if (entries.length === 1 && !isGlob(entries[0])) {
+    let [entry] = entries;
+    try {
+      shouldMakeEntryReferFolder = (await inputFS.stat(entry)).isDirectory();
+    } catch {
+      // ignore failing stat call
+    }
+  }
+
+  // getRootDir treats the input as files, so getRootDir(["/home/user/myproject"]) returns "/home/user".
+  // Instead we need to make the the entry refer to some file inside the specified folders if entries refers to the directory.
+  let entryRoot = getRootDir(
+    shouldMakeEntryReferFolder ? [path.join(entries[0], 'index')] : entries,
+  );
   let projectRootFile =
     (await resolveConfig(
       inputFS,
@@ -71,6 +100,14 @@ export default async function resolveOptions(
       ? path.resolve(outputCwd, initialOptions.cacheDir)
       : path.resolve(projectRoot, DEFAULT_CACHE_DIRNAME);
 
+  // Make the root watch directory configurable. This is useful in some cases
+  // where symlinked dependencies outside the project root need to trigger HMR
+  // updates. Default to the project root if not provided.
+  let watchDir =
+    initialOptions.watchDir != null
+      ? path.resolve(initialOptions.watchDir)
+      : projectRoot;
+
   let cache =
     initialOptions.cache ??
     (outputFS instanceof NodeFS
@@ -89,11 +126,37 @@ export default async function resolveOptions(
       : undefined;
 
   let shouldBuildLazily = initialOptions.shouldBuildLazily ?? false;
+  let lazyIncludes = compileGlobs(initialOptions.lazyIncludes ?? []);
+  if (lazyIncludes.length > 0 && !shouldBuildLazily) {
+    throw new Error(
+      'Lazy includes can only be provided when lazy building is enabled',
+    );
+  }
+  let lazyExcludes = compileGlobs(initialOptions.lazyExcludes ?? []);
+  if (lazyExcludes.length > 0 && !shouldBuildLazily) {
+    throw new Error(
+      'Lazy excludes can only be provided when lazy building is enabled',
+    );
+  }
+
   let shouldContentHash =
     initialOptions.shouldContentHash ?? initialOptions.mode === 'production';
   if (shouldBuildLazily && shouldContentHash) {
     throw new Error('Lazy bundling does not work with content hashing');
   }
+
+  let env = {
+    ...(await loadDotEnv(
+      initialOptions.env ?? {},
+      inputFS,
+      path.join(projectRoot, 'index'),
+      projectRoot,
+    )),
+    ...process.env,
+    ...initialOptions.env,
+  };
+
+  let port = determinePort(initialOptions.serveOptions, env.PORT);
 
   return {
     config: getRelativeConfigSpecifier(
@@ -106,32 +169,31 @@ export default async function resolveOptions(
       projectRoot,
       initialOptions.defaultConfig,
     ),
-    shouldPatchConsole:
-      initialOptions.shouldPatchConsole ?? process.env.NODE_ENV !== 'test',
-    env: {
-      ...process.env,
-      ...initialOptions.env,
-      ...(await loadDotEnv(
-        initialOptions.env ?? {},
-        inputFS,
-        path.join(projectRoot, 'index'),
-        projectRoot,
-      )),
-    },
+    shouldPatchConsole: initialOptions.shouldPatchConsole ?? false,
+    env,
     mode,
     shouldAutoInstall: initialOptions.shouldAutoInstall ?? false,
     hmrOptions: initialOptions.hmrOptions ?? null,
     shouldBuildLazily,
+    lazyIncludes,
+    lazyExcludes,
+    unstableFileInvalidations: initialOptions.unstableFileInvalidations,
+    shouldBundleIncrementally: initialOptions.shouldBundleIncrementally ?? true,
     shouldContentHash,
     serveOptions: initialOptions.serveOptions
       ? {
           ...initialOptions.serveOptions,
           distDir: distDir ?? path.join(outputCwd, 'dist'),
+          port,
         }
       : false,
     shouldDisableCache: initialOptions.shouldDisableCache ?? false,
     shouldProfile: initialOptions.shouldProfile ?? false,
+    shouldTrace: initialOptions.shouldTrace ?? false,
     cacheDir,
+    watchDir,
+    watchBackend: initialOptions.watchBackend,
+    watchIgnore: initialOptions.watchIgnore,
     entries: entries.map(e => toProjectPath(projectRoot, e)),
     targets: initialOptions.targets,
     logLevel: initialOptions.logLevel ?? 'info',
@@ -154,11 +216,15 @@ export default async function resolveOptions(
       publicUrl,
       ...(distDir != null
         ? {distDir: toProjectPath(projectRoot, distDir)}
-        : {...null}),
+        : {
+            /*::...null*/
+          }),
       engines: initialOptions?.defaultTargetOptions?.engines,
       outputFormat: initialOptions?.defaultTargetOptions?.outputFormat,
       isLibrary: initialOptions?.defaultTargetOptions?.isLibrary,
     },
+    featureFlags: {...DEFAULT_FEATURE_FLAGS, ...initialOptions?.featureFlags},
+    parcelVersion: PARCEL_VERSION,
   };
 }
 
@@ -178,4 +244,35 @@ function getRelativeConfigSpecifier(
   } else {
     return specifier;
   }
+}
+
+function determinePort(
+  initialServerOptions: InitialServerOptions | false | void,
+  portInEnv: string | void,
+  defaultPort: number = 1234,
+): number {
+  function parsePort(port: string): number | void {
+    let parsedPort = Number(port);
+
+    // return undefined if port number defined in .env is not valid integer
+    if (!Number.isInteger(parsedPort)) {
+      return undefined;
+    }
+    return parsedPort;
+  }
+
+  if (!initialServerOptions) {
+    return typeof portInEnv !== 'undefined'
+      ? parsePort(portInEnv) ?? defaultPort
+      : defaultPort;
+  }
+
+  // if initialServerOptions.port is equal to defaultPort, then this means that port number is provided via PORT=~~~~ on cli. In this case, we should ignore port number defined in .env.
+  if (initialServerOptions.port !== defaultPort) {
+    return initialServerOptions.port;
+  }
+
+  return typeof portInEnv !== 'undefined'
+    ? parsePort(portInEnv) ?? defaultPort
+    : defaultPort;
 }

@@ -1,33 +1,42 @@
-use crate::dependency_collector::{DependencyDescriptor, DependencyKind};
-use crate::hoist::{Collect, Import};
-use crate::utils::SourceLocation;
-use data_encoding::{BASE64, HEXLOWER};
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use swc_atoms::JsWord;
-use swc_common::{Mark, Span, SyntaxContext, DUMMY_SP};
-use swc_ecmascript::ast::*;
-use swc_ecmascript::visit::{Fold, FoldWith, VisitWith};
 
-type IdentId = (JsWord, SyntaxContext);
-macro_rules! id {
-  ($ident: expr) => {
-    ($ident.sym.clone(), $ident.span.ctxt)
-  };
-}
+use data_encoding::{BASE64, HEXLOWER};
+use swc_core::{
+  common::{Mark, Span, SyntaxContext, DUMMY_SP},
+  ecma::{
+    ast::*,
+    atoms::JsWord,
+    utils::stack_size::maybe_grow_default,
+    visit::{Fold, FoldWith, VisitWith},
+  },
+};
+
+use crate::{
+  collect::{Collect, Import},
+  dependency_collector::{DependencyDescriptor, DependencyFlags, DependencyKind},
+  id,
+  utils::SourceLocation,
+};
 
 pub fn inline_fs<'a>(
   filename: &str,
-  source_map: swc_common::sync::Lrc<swc_common::SourceMap>,
-  decls: HashSet<IdentId>,
+  source_map: swc_core::common::sync::Lrc<swc_core::common::SourceMap>,
+  unresolved_mark: Mark,
   global_mark: Mark,
   project_root: &'a str,
   deps: &'a mut Vec<DependencyDescriptor>,
+  is_module: bool,
 ) -> impl Fold + 'a {
   InlineFS {
     filename: Path::new(filename).to_path_buf(),
-    collect: Collect::new(source_map, decls, Mark::fresh(Mark::root()), global_mark),
-    global_mark,
+    collect: Collect::new(
+      source_map,
+      unresolved_mark,
+      Mark::fresh(Mark::root()),
+      global_mark,
+      false,
+      is_module,
+    ),
     project_root,
     deps,
   }
@@ -36,37 +45,32 @@ pub fn inline_fs<'a>(
 struct InlineFS<'a> {
   filename: PathBuf,
   collect: Collect,
-  global_mark: Mark,
   project_root: &'a str,
   deps: &'a mut Vec<DependencyDescriptor>,
 }
 
 impl<'a> Fold for InlineFS<'a> {
   fn fold_module(&mut self, node: Module) -> Module {
-    node.visit_with(&Invalid { span: DUMMY_SP } as _, &mut self.collect);
+    node.visit_with(&mut self.collect);
     node.fold_children_with(self)
   }
 
   fn fold_expr(&mut self, node: Expr) -> Expr {
-    match &node {
-      Expr::Call(call) => match &call.callee {
-        ExprOrSuper::Expr(expr) => {
-          if let Some((source, specifier)) = self.match_module_reference(expr) {
-            if &source == "fs" && &specifier == "readFileSync" {
-              if let Some(arg) = call.args.get(0) {
-                if let Some(res) = self.evaluate_fs_arg(&*arg.expr, call.args.get(1), call.span) {
-                  return res;
-                }
+    if let Expr::Call(call) = &node {
+      if let Callee::Expr(expr) = &call.callee {
+        if let Some((source, specifier)) = self.match_module_reference(expr) {
+          if &source == "fs" && &specifier == "readFileSync" {
+            if let Some(arg) = call.args.first() {
+              if let Some(res) = self.evaluate_fs_arg(&arg.expr, call.args.get(1), call.span) {
+                return res;
               }
             }
           }
         }
-        _ => {}
-      },
-      _ => {}
+      }
     }
 
-    node.fold_children_with(self)
+    maybe_grow_default(|| node.fold_children_with(self))
   }
 }
 
@@ -82,48 +86,37 @@ impl<'a> InlineFS<'a> {
         }
       }
       Expr::Member(member) => {
-        let prop = match &*member.prop {
-          Expr::Ident(ident) => {
-            if !member.computed {
-              ident.sym.clone()
+        let prop = match &member.prop {
+          MemberProp::Ident(ident) => ident.sym.clone(),
+          MemberProp::Computed(ComputedPropName { expr, .. }) => {
+            if let Expr::Lit(Lit::Str(str_)) = &**expr {
+              str_.value.clone()
             } else {
               return None;
             }
           }
-          Expr::Lit(lit) => match lit {
-            Lit::Str(str_) => str_.value.clone(),
-            _ => return None,
-          },
           _ => return None,
         };
 
-        match &member.obj {
-          ExprOrSuper::Expr(expr) => {
-            if let Some(source) = self.collect.match_require(expr) {
+        if let Some(source) = self.collect.match_require(&member.obj) {
+          return Some((source, prop));
+        }
+
+        if let Expr::Ident(ident) = &*member.obj {
+          if let Some(Import {
+            source, specifier, ..
+          }) = self.collect.imports.get(&id!(ident))
+          {
+            if specifier == "default" || specifier == "*" {
               return Some((source.clone(), prop));
             }
-
-            match &**expr {
-              Expr::Ident(ident) => {
-                if let Some(Import {
-                  source, specifier, ..
-                }) = self.collect.imports.get(&id!(ident))
-                {
-                  if specifier == "default" || specifier == "*" {
-                    return Some((source.clone(), prop));
-                  }
-                }
-              }
-              _ => {}
-            }
           }
-          _ => {}
         }
       }
       _ => {}
     }
 
-    return None;
+    None
   }
 
   fn evaluate_fs_arg(
@@ -142,7 +135,7 @@ impl<'a> InlineFS<'a> {
           Ok(path) => path,
           Err(_err) => return None,
         };
-        if !path.starts_with(&self.project_root) {
+        if !path.starts_with(self.project_root) {
           return None;
         }
 
@@ -181,12 +174,7 @@ impl<'a> InlineFS<'a> {
           _ => return None,
         };
 
-        let contents = Expr::Lit(Lit::Str(Str {
-          value: contents.into(),
-          kind: StrKind::Synthesized,
-          has_escape: false,
-          span: DUMMY_SP,
-        }));
+        let contents = Expr::Lit(Lit::Str(contents.into()));
 
         // Add a file dependency so the cache is invalidated when this file changes.
         self.deps.push(DependencyDescriptor {
@@ -194,8 +182,7 @@ impl<'a> InlineFS<'a> {
           loc: SourceLocation::from(&self.collect.source_map, span),
           specifier: path.to_str().unwrap().into(),
           attributes: None,
-          is_optional: false,
-          is_helper: false,
+          flags: DependencyFlags::empty(),
           source_type: None,
           placeholder: None,
         });
@@ -203,13 +190,13 @@ impl<'a> InlineFS<'a> {
         // If buffer, wrap in Buffer.from(base64String, 'base64')
         if encoding == "buffer" {
           Some(Expr::Call(CallExpr {
-            callee: ExprOrSuper::Expr(Box::new(Expr::Member(MemberExpr {
-              obj: ExprOrSuper::Expr(Box::new(Expr::Ident(Ident::new(
+            callee: Callee::Expr(Box::new(Expr::Member(MemberExpr {
+              obj: Box::new(Expr::Ident(Ident::new(
                 "Buffer".into(),
-                DUMMY_SP.apply_mark(self.global_mark),
-              )))),
-              prop: Box::new(Expr::Ident(Ident::new("from".into(), DUMMY_SP))),
-              computed: false,
+                DUMMY_SP,
+                SyntaxContext::empty().apply_mark(self.collect.unresolved_mark),
+              ))),
+              prop: MemberProp::Ident(IdentName::new("from".into(), DUMMY_SP)),
               span: DUMMY_SP,
             }))),
             args: vec![
@@ -218,23 +205,19 @@ impl<'a> InlineFS<'a> {
                 spread: None,
               },
               ExprOrSpread {
-                expr: Box::new(Expr::Lit(Lit::Str(Str {
-                  value: "base64".into(),
-                  kind: StrKind::Synthesized,
-                  has_escape: false,
-                  span: DUMMY_SP,
-                }))),
+                expr: Box::new(Expr::Lit(Lit::Str("base64".into()))),
                 spread: None,
               },
             ],
             span: DUMMY_SP,
+            ctxt: SyntaxContext::empty(),
             type_args: None,
           }))
         } else {
           Some(contents)
         }
       }
-      _ => return None,
+      _ => None,
     }
   }
 }
@@ -245,12 +228,12 @@ struct Evaluator<'a> {
 
 impl<'a> Fold for Evaluator<'a> {
   fn fold_expr(&mut self, node: Expr) -> Expr {
-    let node = node.fold_children_with(self);
+    let node = maybe_grow_default(|| node.fold_children_with(self));
 
     match &node {
       Expr::Ident(ident) => match ident.sym.to_string().as_str() {
-        "__dirname" => Expr::Lit(Lit::Str(Str {
-          value: self
+        "__dirname" => Expr::Lit(Lit::Str(
+          self
             .inline
             .filename
             .parent()
@@ -258,16 +241,8 @@ impl<'a> Fold for Evaluator<'a> {
             .to_str()
             .unwrap()
             .into(),
-          kind: StrKind::Synthesized,
-          has_escape: false,
-          span: DUMMY_SP,
-        })),
-        "__filename" => Expr::Lit(Lit::Str(Str {
-          value: self.inline.filename.to_str().unwrap().into(),
-          kind: StrKind::Synthesized,
-          has_escape: false,
-          span: DUMMY_SP,
-        })),
+        )),
+        "__filename" => Expr::Lit(Lit::Str(self.inline.filename.to_str().unwrap().into())),
         _ => node,
       },
       Expr::Bin(bin) => match bin.op {
@@ -282,18 +257,13 @@ impl<'a> Fold for Evaluator<'a> {
             _ => return node,
           };
 
-          Expr::Lit(Lit::Str(Str {
-            value: format!("{}{}", left, right).into(),
-            kind: StrKind::Synthesized,
-            has_escape: false,
-            span: DUMMY_SP,
-          }))
+          Expr::Lit(Lit::Str(format!("{}{}", left, right).into()))
         }
         _ => node,
       },
       Expr::Call(call) => {
         let callee = match &call.callee {
-          ExprOrSuper::Expr(expr) => &*expr,
+          Callee::Expr(expr) => expr,
           _ => return node,
         };
 
@@ -306,7 +276,7 @@ impl<'a> Fold for Evaluator<'a> {
                   Expr::Lit(Lit::Str(str_)) => str_.value.clone(),
                   _ => return node,
                 };
-                if path.as_os_str().len() == 0 {
+                if path.as_os_str().is_empty() {
                   path.push(s.to_string());
                 } else {
                   let s = s.to_string();
@@ -321,18 +291,13 @@ impl<'a> Fold for Evaluator<'a> {
                 }
               }
 
-              return Expr::Lit(Lit::Str(Str {
-                value: path.to_str().unwrap().into(),
-                kind: StrKind::Synthesized,
-                has_escape: false,
-                span: DUMMY_SP,
-              }));
+              return Expr::Lit(Lit::Str(path.to_str().unwrap().into()));
             }
             _ => return node,
           }
         }
 
-        return node;
+        node
       }
       _ => node,
     }

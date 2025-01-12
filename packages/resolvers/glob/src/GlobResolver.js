@@ -1,14 +1,40 @@
 // @flow
 import {Resolver} from '@parcel/plugin';
-import {isGlob, glob, relativePath, normalizeSeparators} from '@parcel/utils';
-import micromatch from 'micromatch';
+import {
+  isGlob,
+  glob,
+  globToRegex,
+  relativePath,
+  normalizeSeparators,
+} from '@parcel/utils';
 import path from 'path';
 import nullthrows from 'nullthrows';
-import ThrowableDiagnostic from '@parcel/diagnostic';
+import ThrowableDiagnostic, {
+  convertSourceLocationToHighlight,
+} from '@parcel/diagnostic';
+import NodeResolver from '@parcel/node-resolver-core';
+import invariant from 'assert';
+
+function errorToThrowableDiagnostic(error, dependency): ThrowableDiagnostic {
+  return new ThrowableDiagnostic({
+    diagnostic: {
+      message: error,
+      codeFrames: dependency.loc
+        ? [
+            {
+              codeHighlights: [
+                convertSourceLocationToHighlight(dependency.loc),
+              ],
+            },
+          ]
+        : undefined,
+    },
+  });
+}
 
 export default (new Resolver({
-  async resolve({dependency, options, filePath, pipeline}) {
-    if (!isGlob(filePath)) {
+  async resolve({dependency, options, specifier, pipeline, logger}) {
+    if (!isGlob(specifier)) {
       return;
     }
 
@@ -28,32 +54,119 @@ export default (new Resolver({
     }
 
     if (error) {
-      throw new ThrowableDiagnostic({
-        diagnostic: {
-          message: error,
-          codeFrames: dependency.loc
-            ? [
-                {
-                  codeHighlights: [
-                    {
-                      start: dependency.loc.start,
-                      end: dependency.loc.end,
-                    },
-                  ],
-                },
-              ]
-            : undefined,
-        },
-      });
+      throw errorToThrowableDiagnostic(error, dependency);
     }
 
-    filePath = path.resolve(path.dirname(sourceFile), filePath);
-    let normalized = normalizeSeparators(filePath);
+    let invalidateOnFileCreate = [];
+    let invalidateOnFileChange = new Set();
+
+    switch (specifier[0]) {
+      // Path specifier
+      case '.': {
+        specifier = path.resolve(path.dirname(sourceFile), specifier);
+        break;
+      }
+
+      // Absolute path. Make the glob relative to the project root.
+      case '/': {
+        specifier = path.resolve(options.projectRoot, specifier.slice(1));
+        break;
+      }
+
+      // Tilde path. Package relative. Resolve relative to nearest node_modules
+      // directory, the nearest directory with package.json or the project
+      // root - whichever comes first.
+      case '~': {
+        let dir = path.dirname(sourceFile);
+        let pkgPath = nullthrows(
+          options.inputFS.findAncestorFile(
+            ['package.json'],
+            dir,
+            options.projectRoot,
+          ),
+        );
+        specifier = path.resolve(path.dirname(pkgPath), specifier.slice(2));
+        break;
+      }
+
+      // Support package-ish specifiers like:
+      //   foo      (node_module)
+      //   @foo/bar (scoped node_module)
+      //
+      // First we resolve the initial portion using NodeResolver, then we tack
+      // on the remaining glob.
+      default: {
+        // Globs are not paths - so they always use / (see https://github.com/micromatch/micromatch#backslashes)
+        let splitOn = specifier.indexOf('/');
+        if (specifier[0] === '@') {
+          splitOn = specifier.indexOf('/', splitOn + 1);
+        }
+
+        // Since we've already asserted earlier that there is a glob present, it shouldn't be
+        // possible for there to be only a package here without any other path parts (e.g. `import('pkg')`)
+        invariant(splitOn !== -1);
+
+        let pkg = specifier.substring(0, splitOn);
+        let rest = specifier.substring(splitOn + 1);
+
+        // This initialisation code is copied from the DefaultResolver
+        const resolver = new NodeResolver({
+          fs: options.inputFS,
+          projectRoot: options.projectRoot,
+          packageManager: options.shouldAutoInstall
+            ? options.packageManager
+            : undefined,
+          mode: options.mode,
+          logger,
+        });
+
+        let result;
+        try {
+          result = await resolver.resolve({
+            filename: pkg + '/package.json',
+            parent: dependency.resolveFrom,
+            specifierType: 'esm',
+            env: dependency.env,
+            sourcePath: dependency.sourcePath,
+          });
+        } catch (err) {
+          if (err instanceof ThrowableDiagnostic) {
+            // Return instead of throwing so we can provide invalidations.
+            return {
+              diagnostics: err.diagnostics,
+              invalidateOnFileCreate,
+              invalidateOnFileChange: [...invalidateOnFileChange],
+            };
+          } else {
+            throw err;
+          }
+        }
+
+        if (!result || !result.filePath) {
+          throw errorToThrowableDiagnostic(
+            `Unable to resolve ${pkg} from ${sourceFile} when resolving specifier ${specifier}`,
+            dependency,
+          );
+        }
+
+        specifier = path.resolve(path.dirname(result.filePath), rest);
+        if (result.invalidateOnFileChange) {
+          for (let f of result.invalidateOnFileChange) {
+            invalidateOnFileChange.add(f);
+          }
+        }
+        if (result.invalidateOnFileCreate) {
+          invalidateOnFileCreate.push(...result.invalidateOnFileCreate);
+        }
+      }
+    }
+
+    let normalized = normalizeSeparators(specifier);
     let files = await glob(normalized, options.inputFS, {
       onlyFiles: true,
     });
 
-    let dir = path.dirname(filePath);
+    let dir = path.dirname(sourceFile);
     let results = files.map(file => {
       let relative = relativePath(dir, file);
       if (pipeline) {
@@ -65,7 +178,7 @@ export default (new Resolver({
 
     let code = '';
     if (sourceAssetType === 'js') {
-      let re = micromatch.makeRe(normalized, {capture: true});
+      let re = globToRegex(normalized, {capture: true});
       let matches = {};
       for (let [file, relative] of results) {
         let match = file.match(re);
@@ -85,13 +198,18 @@ export default (new Resolver({
       }
     }
 
+    invalidateOnFileCreate.push({glob: normalized});
+
     return {
       filePath: path.join(
         dir,
-        path.basename(filePath, path.extname(filePath)) + '.' + sourceAssetType,
+        path.basename(specifier, path.extname(specifier)) +
+          '.' +
+          sourceAssetType,
       ),
       code,
-      invalidateOnFileCreate: [{glob: normalized}],
+      invalidateOnFileCreate,
+      invalidateOnFileChange: [...invalidateOnFileChange],
       pipeline: null,
       priority: 'sync',
     };
@@ -139,12 +257,11 @@ function generate(matches, isAsync, indent = '', count = 0) {
       res += ',';
     }
 
-    let {imports: i, value, count: c} = generate(
-      matches[key],
-      isAsync,
-      indent + '  ',
-      count,
-    );
+    let {
+      imports: i,
+      value,
+      count: c,
+    } = generate(matches[key], isAsync, indent + '  ', count);
     imports += `${i}\n`;
     count = c;
 

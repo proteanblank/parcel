@@ -150,16 +150,16 @@ describe('AssetGraph', () => {
         }).id,
       ),
     );
-    assert.deepEqual(graph.getAllEdges(), [
+    assert.deepEqual(Array.from(graph.getAllEdges()), [
       {
         from: graph.rootNodeId,
         to: graph.getNodeIdByContentKey('entry_specifier:path/to/index1'),
-        type: null,
+        type: 1,
       },
       {
         from: graph.rootNodeId,
         to: graph.getNodeIdByContentKey('entry_specifier:path/to/index2'),
-        type: null,
+        type: 1,
       },
       {
         from: graph.getNodeIdByContentKey('entry_specifier:path/to/index1'),
@@ -169,7 +169,7 @@ describe('AssetGraph', () => {
             packagePath: toProjectPath('/path/to/index1'),
           }).id,
         ),
-        type: null,
+        type: 1,
       },
       {
         from: graph.getNodeIdByContentKey('entry_specifier:path/to/index2'),
@@ -179,7 +179,7 @@ describe('AssetGraph', () => {
             packagePath: toProjectPath('/path/to/index2'),
           }).id,
         ),
-        type: null,
+        type: 1,
       },
       {
         from: graph.getNodeIdByContentKey(
@@ -196,7 +196,7 @@ describe('AssetGraph', () => {
             env: DEFAULT_ENV,
           }).id,
         ),
-        type: null,
+        type: 1,
       },
       {
         from: graph.getNodeIdByContentKey(
@@ -213,7 +213,7 @@ describe('AssetGraph', () => {
             env: DEFAULT_ENV,
           }).id,
         ),
-        type: null,
+        type: 1,
       },
     ]);
   });
@@ -253,7 +253,6 @@ describe('AssetGraph', () => {
     let req = {
       filePath: toProjectPath('/index.js'),
       env: DEFAULT_ENV,
-      query: {},
     };
 
     graph.resolveDependency(dep, req, '3');
@@ -261,26 +260,25 @@ describe('AssetGraph', () => {
       nodeFromAssetGroup(req).id,
     );
     let dependencyNodeId = graph.getNodeIdByContentKey(dep.id);
-    assert(graph.nodes.has(assetGroupNodeId));
+    assert(graph.hasNode(assetGroupNodeId));
     assert(graph.hasEdge(dependencyNodeId, assetGroupNodeId));
 
     let req2 = {
       filePath: toProjectPath('/index.jsx'),
       env: DEFAULT_ENV,
-      query: {},
     };
     graph.resolveDependency(dep, req2, '4');
 
     let assetGroupNodeId2 = graph.getNodeIdByContentKey(
       nodeFromAssetGroup(req2).id,
     );
-    assert(!graph.nodes.has(assetGroupNodeId));
-    assert(graph.nodes.has(assetGroupNodeId2));
+    assert(!graph.hasNode(assetGroupNodeId));
+    assert(graph.hasNode(assetGroupNodeId2));
     assert(graph.hasEdge(dependencyNodeId, assetGroupNodeId2));
     assert(!graph.hasEdge(dependencyNodeId, assetGroupNodeId));
 
     graph.resolveDependency(dep, req2, '5');
-    assert(graph.nodes.has(assetGroupNodeId2));
+    assert(graph.hasNode(assetGroupNodeId2));
     assert(graph.hasEdge(dependencyNodeId, assetGroupNodeId2));
   });
 
@@ -319,7 +317,7 @@ describe('AssetGraph', () => {
     });
     let sourcePath = '/index.js';
     let filePath = toProjectPath(sourcePath);
-    let req = {filePath, env: DEFAULT_ENV, query: {}};
+    let req = {filePath, env: DEFAULT_ENV};
     graph.resolveDependency(dep, req, '3');
     let assets = [
       createAsset({
@@ -327,7 +325,6 @@ describe('AssetGraph', () => {
         filePath,
         type: 'js',
         isSource: true,
-        hash: '#1',
         stats,
         dependencies: new Map([
           [
@@ -347,7 +344,6 @@ describe('AssetGraph', () => {
         filePath,
         type: 'js',
         isSource: true,
-        hash: '#2',
         stats,
         dependencies: new Map([
           [
@@ -367,7 +363,6 @@ describe('AssetGraph', () => {
         filePath,
         type: 'js',
         isSource: true,
-        hash: '#3',
         dependencies: new Map(),
         env: DEFAULT_ENV,
         stats,
@@ -391,11 +386,11 @@ describe('AssetGraph', () => {
       [...assets[1].dependencies.values()][0].id,
     );
 
-    assert(graph.nodes.has(nodeId1));
-    assert(graph.nodes.has(nodeId2));
-    assert(graph.nodes.has(nodeId3));
-    assert(graph.nodes.has(dependencyNodeId1));
-    assert(graph.nodes.has(dependencyNodeId2));
+    assert(graph.hasNode(nodeId1));
+    assert(graph.hasNode(nodeId2));
+    assert(graph.hasNode(nodeId3));
+    assert(graph.hasNode(dependencyNodeId1));
+    assert(graph.hasNode(dependencyNodeId2));
     assert(graph.hasEdge(assetGroupNode, nodeId1));
     assert(graph.hasEdge(assetGroupNode, nodeId2));
     assert(graph.hasEdge(assetGroupNode, nodeId3));
@@ -408,7 +403,6 @@ describe('AssetGraph', () => {
         filePath,
         type: 'js',
         isSource: true,
-        hash: '#1',
         stats,
         dependencies: new Map([
           [
@@ -428,7 +422,6 @@ describe('AssetGraph', () => {
         filePath,
         type: 'js',
         isSource: true,
-        hash: '#2',
         stats,
         dependencies: new Map(),
         env: DEFAULT_ENV,
@@ -437,11 +430,11 @@ describe('AssetGraph', () => {
 
     graph.resolveAssetGroup(req, assets2, '5');
 
-    assert(graph.nodes.has(nodeId1));
-    assert(graph.nodes.has(nodeId2));
-    assert(!graph.nodes.has(nodeId3));
-    assert(graph.nodes.has(dependencyNodeId1));
-    assert(!graph.nodes.has(dependencyNodeId2));
+    assert(graph.hasNode(nodeId1));
+    assert(graph.hasNode(nodeId2));
+    assert(!graph.hasNode(nodeId3));
+    assert(graph.hasNode(dependencyNodeId1));
+    assert(!graph.hasNode(dependencyNodeId2));
     assert(graph.hasEdge(assetGroupNode, nodeId1));
     assert(graph.hasEdge(assetGroupNode, nodeId2));
     assert(!graph.hasEdge(assetGroupNode, nodeId3));
@@ -486,7 +479,7 @@ describe('AssetGraph', () => {
     });
     let sourcePath = '/index.js';
     let filePath = toProjectPath(sourcePath);
-    let req = {filePath, env: DEFAULT_ENV, query: {}};
+    let req = {filePath, env: DEFAULT_ENV};
     graph.resolveDependency(dep, req, '123');
     let dep1 = createDependency({
       specifier: 'dependent-asset-1',
@@ -506,7 +499,6 @@ describe('AssetGraph', () => {
         filePath,
         type: 'js',
         isSource: true,
-        hash: '#1',
         stats,
         dependencies: new Map([['dep1', dep1]]),
         env: DEFAULT_ENV,
@@ -517,7 +509,6 @@ describe('AssetGraph', () => {
         filePath,
         type: 'js',
         isSource: true,
-        hash: '#1',
         stats,
         dependencies: new Map([['dep2', dep2]]),
         env: DEFAULT_ENV,
@@ -528,7 +519,6 @@ describe('AssetGraph', () => {
         filePath,
         type: 'js',
         isSource: true,
-        hash: '#1',
         stats,
         env: DEFAULT_ENV,
       }),
@@ -566,7 +556,6 @@ describe('AssetGraph', () => {
     let indexAssetGroup = {
       filePath: toProjectPath('/index.js'),
       env: DEFAULT_ENV,
-      query: {},
     };
     graph.setRootConnections({assetGroups: [indexAssetGroup]});
     let indexFooDep = createDependency({
@@ -586,7 +575,6 @@ describe('AssetGraph', () => {
       filePath: toProjectPath('/index.js'),
       type: 'js',
       isSource: true,
-      hash: '#4',
       stats,
       dependencies: new Map([
         ['./foo', indexFooDep],
@@ -600,7 +588,6 @@ describe('AssetGraph', () => {
     let fooAssetGroup = {
       filePath: toProjectPath('/foo.js'),
       env: DEFAULT_ENV,
-      query: {},
     };
     graph.resolveDependency(indexFooDep, fooAssetGroup, '0');
     let fooAssetGroupNode = nodeFromAssetGroup(fooAssetGroup);
@@ -616,7 +603,6 @@ describe('AssetGraph', () => {
       filePath: toProjectPath('/foo.js'),
       type: 'js',
       isSource: true,
-      hash: '#1',
       stats,
       dependencies: new Map([['./utils', fooUtilsDep]]),
       env: DEFAULT_ENV,
@@ -626,7 +612,6 @@ describe('AssetGraph', () => {
     let utilsAssetGroup = {
       filePath: toProjectPath('/utils.js'),
       env: DEFAULT_ENV,
-      query: {},
     };
     let utilsAssetGroupNode = nodeFromAssetGroup(utilsAssetGroup);
     graph.resolveDependency(fooUtilsDep, utilsAssetGroup, '0');
@@ -646,7 +631,6 @@ describe('AssetGraph', () => {
     let barAssetGroup = {
       filePath: toProjectPath('/bar.js'),
       env: DEFAULT_ENV,
-      query: {},
     };
     graph.resolveDependency(indexBarDep, barAssetGroup, '0');
     let barAssetGroupNode = nodeFromAssetGroup(barAssetGroup);
@@ -661,7 +645,6 @@ describe('AssetGraph', () => {
       filePath: toProjectPath('/bar.js'),
       type: 'js',
       isSource: true,
-      hash: '#2',
       stats,
       dependencies: new Map([['./utils', barUtilsDep]]),
       env: DEFAULT_ENV,

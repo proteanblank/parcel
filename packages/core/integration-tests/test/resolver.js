@@ -1,9 +1,10 @@
+// @flow strict-local
 import assert from 'assert';
 import path from 'path';
 import {bundle, run, ncp, overlayFS, outputFS} from '@parcel/test-utils';
 
-describe('resolver', function() {
-  it('should support resolving tilde in monorepo packages', async function() {
+describe('resolver', function () {
+  it('should support resolving tilde in monorepo packages', async function () {
     let b = await bundle(
       path.join(
         __dirname,
@@ -15,7 +16,7 @@ describe('resolver', function() {
     assert.strictEqual(output.default, 1234);
   });
 
-  it('should support node: prefix for node_modules', async function() {
+  it('should support node: prefix for node_modules', async function () {
     let b = await bundle(
       path.join(__dirname, '/integration/resolve-node-prefix/src/index.js'),
     );
@@ -27,7 +28,7 @@ describe('resolver', function() {
     );
   });
 
-  it('should correctly resolve tilde in node_modules', async function() {
+  it('should correctly resolve tilde in node_modules', async function () {
     let b = await bundle(
       path.join(__dirname, '/integration/resolve-tilde-nodemodules/index.js'),
     );
@@ -36,7 +37,7 @@ describe('resolver', function() {
     assert.strictEqual(output.default, 1234);
   });
 
-  it('should fall back to index.js if the resolved `main` file does not exist', async function() {
+  it('should fall back to index.js if the resolved `main` file does not exist', async function () {
     let b = await bundle(
       path.join(
         __dirname,
@@ -48,7 +49,7 @@ describe('resolver', function() {
     assert.strictEqual(output.default, 42);
   });
 
-  it('should fall back to index.js if there is no `main` field at all', async function() {
+  it('should fall back to index.js if there is no `main` field at all', async function () {
     let b = await bundle(
       path.join(__dirname, '/integration/resolve-index-fallback/no-entry.js'),
     );
@@ -57,7 +58,7 @@ describe('resolver', function() {
     assert.strictEqual(output.default, 42);
   });
 
-  it('should print a diagnostic when a configured target field will overwrite an entry', async function() {
+  it('should print a diagnostic when a configured target field will overwrite an entry', async function () {
     let errorThrows = 0;
     const overwriteDirs = ['browser', 'app', 'main', 'module'];
     for (const currDir of overwriteDirs) {
@@ -89,7 +90,7 @@ describe('resolver', function() {
     assert.deepEqual(errorThrows, overwriteDirs.length);
   });
 
-  it('should throw an error on Webpack loader imports', async function() {
+  it('should throw an error on Webpack loader imports', async function () {
     let didThrow = false;
     try {
       await bundle(
@@ -109,7 +110,7 @@ describe('resolver', function() {
     assert(didThrow);
   });
 
-  it('should throw an error with codeframe on invalid js import', async function() {
+  it('should throw an error with codeframe on invalid js import', async function () {
     let didThrow = false;
     try {
       await bundle(
@@ -125,6 +126,7 @@ describe('resolver', function() {
       );
 
       assert.deepEqual(e.diagnostics[0].codeFrames[0].codeHighlights[0], {
+        message: undefined,
         start: {line: 1, column: 8},
         end: {line: 1, column: 25},
       });
@@ -133,7 +135,7 @@ describe('resolver', function() {
     assert(didThrow);
   });
 
-  it('should throw an error with codeframe on invalid css import', async function() {
+  it('should throw an error with codeframe on invalid css import', async function () {
     let didThrow = false;
     try {
       await bundle(
@@ -149,6 +151,7 @@ describe('resolver', function() {
       );
 
       assert.deepEqual(e.diagnostics[0].codeFrames[0].codeHighlights[0], {
+        message: undefined,
         start: {line: 1, column: 9},
         end: {line: 1, column: 32},
       });
@@ -157,7 +160,7 @@ describe('resolver', function() {
     assert(didThrow);
   });
 
-  it('Should return codeframe with hints when package.json is invalid', async function() {
+  it('Should return codeframe with hints when package.json is invalid', async function () {
     let didThrow = false;
     try {
       await bundle(
@@ -187,7 +190,7 @@ describe('resolver', function() {
     assert(didThrow);
   });
 
-  it('Should suggest alternative filenames for relative imports', async function() {
+  it('Should suggest alternative filenames for relative imports', async function () {
     let threw = 0;
 
     try {
@@ -244,7 +247,7 @@ describe('resolver', function() {
     assert.equal(threw, 3);
   });
 
-  it('Should suggest alternative modules for module imports', async function() {
+  it('Should suggest alternative modules for module imports', async function () {
     let threw = false;
 
     try {
@@ -257,7 +260,10 @@ describe('resolver', function() {
     } catch (e) {
       threw = true;
 
-      assert.equal(e.diagnostics[1].message, `Cannot find module @baebal/core`);
+      assert.equal(
+        e.diagnostics[1].message,
+        `Cannot find module '@baebal/core'`,
+      );
 
       assert.equal(
         e.diagnostics[1].hints[0],
@@ -268,7 +274,7 @@ describe('resolver', function() {
     assert(threw);
   });
 
-  it('should resolve packages to packages through the alias field', async function() {
+  it('should resolve packages to packages through the alias field', async function () {
     let b = await bundle(
       path.join(__dirname, '/integration/alias/package-to-package.js'),
     );
@@ -277,7 +283,7 @@ describe('resolver', function() {
     assert.strictEqual(output.default, 3);
   });
 
-  it('should resolve packages to local files through the alias field', async function() {
+  it('should resolve packages to local files through the alias field', async function () {
     let b = await bundle(
       path.join(__dirname, '/integration/alias/package-to-local.js'),
     );
@@ -286,7 +292,7 @@ describe('resolver', function() {
     assert.strictEqual(output.default, 'bar');
   });
 
-  it('should exclude local files using the alias field', async function() {
+  it('should exclude local files using the alias field', async function () {
     let b = await bundle(
       path.join(__dirname, '/integration/alias/exclude-local.js'),
     );
@@ -295,7 +301,7 @@ describe('resolver', function() {
     assert.deepEqual(output.default, {});
   });
 
-  it('should exclude packages using the alias field', async function() {
+  it('should exclude packages using the alias field', async function () {
     let b = await bundle(
       path.join(__dirname, '/integration/alias/exclude-package.js'),
     );
@@ -304,7 +310,7 @@ describe('resolver', function() {
     assert.deepEqual(output.default, {});
   });
 
-  it('should support symlinked node_modules structure', async function() {
+  it('should support symlinked node_modules structure', async function () {
     const rootDir = path.join(
       __dirname,
       'integration/resolve-symlinked-node_modules-structure',
@@ -346,7 +352,7 @@ describe('resolver', function() {
     assert.strictEqual(output.default, 42);
   });
 
-  it('should support symlinked monorepos structure', async function() {
+  it('should support symlinked monorepos structure', async function () {
     const rootDir = path.join(
       __dirname,
       'integration/resolve-symlinked-monorepos',
@@ -381,5 +387,61 @@ describe('resolver', function() {
 
     let output = await run(b);
     assert.strictEqual(output.default, 2);
+  });
+
+  it('should support very long dependency specifiers', async function () {
+    this.timeout(8000);
+
+    let inputDir = path.join(__dirname, 'input');
+
+    await outputFS.mkdirp(inputDir);
+    await outputFS.writeFile(
+      path.join(inputDir, 'index.html'),
+      `<img src="data:image/jpeg;base64,/9j/${'A'.repeat(200000)}">`,
+    );
+
+    await bundle(path.join(inputDir, 'index.html'), {
+      inputFS: overlayFS,
+    });
+  });
+
+  it('should support empty dependency specifiers', async function () {
+    // $FlowFixMe[prop-missing];
+    await assert.rejects(
+      () =>
+        bundle(
+          path.join(__dirname, '/integration/resolve-empty-specifier/index.js'),
+        ),
+      {
+        message: `Failed to resolve '' from './integration/resolve-empty-specifier/index.js'`,
+      },
+    );
+  });
+
+  it('should support package exports config option', async () => {
+    let b = await bundle(
+      path.join(__dirname, '/integration/resolve-exports/index.js'),
+    );
+
+    let output = await run(b);
+    assert.strictEqual(output.default, 'hello bar');
+  });
+
+  it('should support the development and production import conditions', async () => {
+    let b = await bundle(
+      path.join(__dirname, '/integration/resolve-mode-condition/index.js'),
+      {mode: 'development'},
+    );
+
+    let output = await run(b);
+    assert.strictEqual(output.default, 'development');
+
+    b = await bundle(
+      path.join(__dirname, '/integration/resolve-mode-condition/index.js'),
+      {mode: 'production'},
+    );
+
+    output = await run(b);
+    assert.strictEqual(output.default, 'production');
   });
 });

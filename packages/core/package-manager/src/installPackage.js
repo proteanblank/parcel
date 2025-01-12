@@ -6,7 +6,7 @@ import type {
   PackageManager,
   PackageInstaller,
   InstallOptions,
-} from './types';
+} from '@parcel/types';
 import type {FileSystem} from '@parcel/fs';
 
 import invariant from 'assert';
@@ -26,6 +26,7 @@ import {Npm} from './Npm';
 import {Yarn} from './Yarn';
 import {Pnpm} from './Pnpm.js';
 import {getConflictingLocalDependencies} from './utils';
+import getCurrentPackageManager from './getCurrentPackageManager';
 import validateModuleSpecifier from './validateModuleSpecifier';
 
 async function install(
@@ -173,6 +174,15 @@ async function determinePackageInstaller(
     return new Yarn();
   }
 
+  let currentPackageManager = getCurrentPackageManager()?.name;
+  if (currentPackageManager === 'npm') {
+    return new Npm();
+  } else if (currentPackageManager === 'yarn') {
+    return new Yarn();
+  } else if (currentPackageManager === 'pnpm') {
+    return new Pnpm();
+  }
+
   if (await Yarn.exists()) {
     return new Yarn();
   } else if (await Pnpm.exists()) {
@@ -246,8 +256,14 @@ export function installPackage(
 ): Promise<mixed> {
   if (WorkerFarm.isWorker()) {
     let workerApi = WorkerFarm.getWorkerApi();
+    // TODO this should really be `__filename` but without the rewriting.
+    let bundlePath =
+      process.env.PARCEL_BUILD_ENV === 'production' &&
+      !process.env.PARCEL_SELF_BUILD
+        ? path.join(__dirname, '..', 'lib/index.js')
+        : __filename;
     return workerApi.callMaster({
-      location: __filename,
+      location: bundlePath,
       args: [fs, packageManager, modules, filePath, projectRoot, options],
       method: '_addToInstallQueue',
     });

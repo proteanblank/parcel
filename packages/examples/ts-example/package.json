@@ -1,21 +1,20 @@
 {
   "name": "@parcel/ts-example",
-  "version": "2.0.0-rc.0",
+  "version": "2.13.3",
   "license": "MIT",
   "private": true,
   "scripts": {
-    "demo": "parcel build src/index.ts"
+    "demo": "parcel build src/index.ts --no-cache"
   },
   "devDependencies": {
-    "@parcel/babel-register": "2.0.0-rc.0",
-    "@parcel/core": "2.0.0-rc.0"
+    "@babel/core": "^7.22.11",
+    "@parcel/babel-register": "2.13.3",
+    "@parcel/core": "2.13.3"
   },
   "main": "dist/main.js",
   "module": "dist/module.js",
   "types": "dist/types.d.ts",
   "dependencies": {
-    "lodash": "^4.17.11",
-    "react": "^16.6.3",
-    "react-dom": "^16.6.3"
+    "lodash": "^4.17.11"
   }
 }

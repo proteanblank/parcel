@@ -1,4 +1,4 @@
-// @flow
+// @flow strict-local
 
 import type {
   Transformer as TransformerOpts,
@@ -8,6 +8,7 @@ import type {
   Runtime as RuntimeOpts,
   Packager as PackagerOpts,
   Optimizer as OptimizerOpts,
+  Compressor as CompressorOpts,
   Reporter as ReporterOpts,
   Validator as ValidatorOpts,
 } from '@parcel/types';
@@ -22,7 +23,7 @@ export class Transformer {
 }
 
 export class Resolver {
-  constructor(opts: ResolverOpts) {
+  constructor<T>(opts: ResolverOpts<T>) {
     // $FlowFixMe
     this[CONFIG] = opts;
   }
@@ -57,14 +58,21 @@ export class Validator {
 }
 
 export class Packager {
-  constructor<T>(opts: PackagerOpts<T>) {
+  constructor<T, U>(opts: PackagerOpts<T, U>) {
     // $FlowFixMe
     this[CONFIG] = opts;
   }
 }
 
 export class Optimizer {
-  constructor<T>(opts: OptimizerOpts<T>) {
+  constructor<T, U>(opts: OptimizerOpts<T, U>) {
+    // $FlowFixMe
+    this[CONFIG] = opts;
+  }
+}
+
+export class Compressor {
+  constructor(opts: CompressorOpts) {
     // $FlowFixMe
     this[CONFIG] = opts;
   }

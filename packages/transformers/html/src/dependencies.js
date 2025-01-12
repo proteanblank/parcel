@@ -1,9 +1,9 @@
 // @flow
 
-import type {AST, MutableAsset} from '@parcel/types';
+import type {AST, MutableAsset, FilePath} from '@parcel/types';
 import type {PostHTMLNode} from 'posthtml';
 import PostHTML from 'posthtml';
-
+import {parse, stringify} from 'srcset';
 // A list of all attributes that may produce a dependency
 // Based on https://developer.mozilla.org/en-US/docs/Web/HTML/Attributes
 const ATTRS = {
@@ -19,7 +19,7 @@ const ATTRS = {
     'amp-img',
   ],
   // Using href with <script> is described here: https://developer.mozilla.org/en-US/docs/Web/SVG/Element/script
-  href: ['link', 'a', 'use', 'script'],
+  href: ['link', 'a', 'use', 'script', 'image'],
   srcset: ['img', 'source'],
   imagesrcset: ['link'],
   poster: ['video'],
@@ -65,6 +65,8 @@ const META = {
   ],
 };
 
+const FEED_TYPES = new Set(['application/rss+xml', 'application/atom+xml']);
+
 // Options to be passed to `addDependency` for certain tags + attributes
 const OPTIONS = {
   a: {
@@ -84,18 +86,11 @@ const OPTIONS = {
 };
 
 function collectSrcSetDependencies(asset, srcset, opts) {
-  let newSources = [];
-  for (const source of srcset.split(',')) {
-    let pair = source.trim().split(' ');
-    if (pair.length === 0) {
-      continue;
-    }
-
-    pair[0] = asset.addURLDependency(pair[0], opts);
-    newSources.push(pair.join(' '));
-  }
-
-  return newSources.join(',');
+  let parsed = parse(srcset).map(({url, ...v}) => ({
+    url: asset.addURLDependency(url, opts),
+    ...v,
+  }));
+  return stringify(parsed);
 }
 
 function getAttrDepHandler(attr) {
@@ -111,8 +106,13 @@ export default function collectDependencies(
   ast: AST,
 ): boolean {
   let isDirty = false;
-  let hasScripts = false;
+  let hasModuleScripts = false;
   let seen = new Set();
+  let errors: Array<{|
+    message: string,
+    filePath: FilePath,
+    loc: PostHTMLNode['location'],
+  |}> = [];
   PostHTML().walk.call(ast.program, node => {
     let {tag, attrs} = node;
     if (!attrs || seen.has(node)) {
@@ -122,24 +122,35 @@ export default function collectDependencies(
     seen.add(node);
 
     if (tag === 'meta') {
-      if (
-        !Object.keys(attrs).some(attr => {
-          let values = META[attr];
-          return (
-            values &&
-            values.includes(attrs[attr]) &&
-            attrs.content !== '' &&
-            !(attrs.name === 'msapplication-config' && attrs.content === 'none')
-          );
-        })
-      ) {
-        return node;
+      const isMetaDependency = Object.keys(attrs).some(attr => {
+        let values = META[attr];
+        return (
+          values &&
+          values.includes(attrs[attr]) &&
+          attrs.content !== '' &&
+          !(attrs.name === 'msapplication-config' && attrs.content === 'none')
+        );
+      });
+      if (isMetaDependency) {
+        const metaAssetUrl = attrs.content;
+        if (metaAssetUrl) {
+          attrs.content = asset.addURLDependency(attrs.content, {
+            needsStableName: !(
+              attrs.name && attrs.name.includes('msapplication')
+            ),
+          });
+          isDirty = true;
+          asset.setAST(ast);
+        }
       }
+      return node;
     }
 
     if (
       tag === 'link' &&
-      (attrs.rel === 'canonical' || attrs.rel === 'manifest') &&
+      (attrs.rel === 'canonical' ||
+        attrs.rel === 'manifest' ||
+        (attrs.rel === 'alternate' && FEED_TYPES.has(attrs.type))) &&
       attrs.href
     ) {
       let href = attrs.href;
@@ -165,12 +176,19 @@ export default function collectDependencies(
         ? {
             filePath: asset.filePath,
             start: node.location.start,
-            end: node.location.end,
+            end: {
+              line: node.location.end.line,
+              // PostHTML's location is inclusive
+              column: node.location.end.column + 1,
+            },
           }
         : undefined;
 
       let outputFormat = 'global';
-      if (attrs.type === 'module' && asset.env.shouldScopeHoist) {
+      if (
+        attrs.type === 'module' &&
+        (asset.env.shouldScopeHoist || asset.env.supports('esmodules', true))
+      ) {
         outputFormat = 'esmodule';
       } else {
         if (attrs.type === 'module') {
@@ -228,13 +246,13 @@ export default function collectDependencies(
       });
 
       asset.setAST(ast);
-      hasScripts = true;
+      if (sourceType === 'module') hasModuleScripts = true;
       return copy ? [node, copy] : node;
     }
 
     for (let attr in attrs) {
       // Check for virtual paths
-      if (tag === 'a' && attrs[attr].lastIndexOf('.') < 1) {
+      if (tag === 'a' && attrs[attr].split('#')[0].lastIndexOf('.') < 1) {
         continue;
       }
 
@@ -245,6 +263,15 @@ export default function collectDependencies(
 
       let elements = ATTRS[attr];
       if (elements && elements.includes(node.tag)) {
+        // Check for empty string
+        if (attrs[attr].length === 0) {
+          errors.push({
+            message: `'${attr}' should not be empty string`,
+            filePath: asset.filePath,
+            loc: node.location,
+          });
+        }
+
         let depHandler = getAttrDepHandler(attr);
         let depOptionsHandler = OPTIONS[node.tag];
         let depOptions =
@@ -263,5 +290,9 @@ export default function collectDependencies(
     return node;
   });
 
-  return hasScripts;
+  if (errors.length > 0) {
+    throw errors;
+  }
+
+  return hasModuleScripts;
 }

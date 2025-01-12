@@ -19,14 +19,13 @@ import type {
   Stats,
   MutableAssetSymbols as IMutableAssetSymbols,
   AssetSymbols as IAssetSymbols,
-  QueryParameters,
   BundleBehavior,
 } from '@parcel/types';
 import type {Asset as AssetValue, ParcelOptions} from '../types';
 
 import nullthrows from 'nullthrows';
 import Environment from './Environment';
-import Dependency from './Dependency';
+import {getPublicDependency} from './Dependency';
 import {AssetSymbols, MutableAssetSymbols} from './Symbols';
 import UncommittedAsset from '../UncommittedAsset';
 import CommittedAsset from '../CommittedAsset';
@@ -42,10 +41,8 @@ const inspect = Symbol.for('nodejs.util.inspect.custom');
 
 const uncommittedAssetValueToAsset: WeakMap<AssetValue, Asset> = new WeakMap();
 const committedAssetValueToAsset: WeakMap<AssetValue, Asset> = new WeakMap();
-const assetValueToMutableAsset: WeakMap<
-  AssetValue,
-  MutableAsset,
-> = new WeakMap();
+const assetValueToMutableAsset: WeakMap<AssetValue, MutableAsset> =
+  new WeakMap();
 
 const _assetToAssetValue: WeakMap<
   IAsset | IMutableAsset | BaseAsset,
@@ -83,13 +80,14 @@ export function assetFromValue(
 
 class BaseAsset {
   #asset: CommittedAsset | UncommittedAsset;
+  #query /*: ?URLSearchParams */;
 
   constructor(asset: CommittedAsset | UncommittedAsset) {
     this.#asset = asset;
     _assetToAssetValue.set(this, asset.value);
   }
 
-  // $FlowFixMe
+  // $FlowFixMe[unsupported-syntax]
   [inspect](): string {
     return `Asset(${this.filePath})`;
   }
@@ -117,8 +115,11 @@ class BaseAsset {
     );
   }
 
-  get query(): QueryParameters {
-    return this.#asset.value.query ?? {};
+  get query(): URLSearchParams {
+    if (!this.#query) {
+      this.#query = new URLSearchParams(this.#asset.value.query ?? '');
+    }
+    return this.#query;
   }
 
   get meta(): Meta {
@@ -161,7 +162,7 @@ class BaseAsset {
   getDependencies(): $ReadOnlyArray<IDependency> {
     return this.#asset
       .getDependencies()
-      .map(dep => new Dependency(dep, this.#asset.options));
+      .map(dep => getPublicDependency(dep, this.#asset.options));
   }
 
   getCode(): Promise<string> {
@@ -191,6 +192,7 @@ class BaseAsset {
 
 export class Asset extends BaseAsset implements IAsset {
   #asset /*: CommittedAsset | UncommittedAsset */;
+  #env /*: ?Environment */;
 
   constructor(asset: CommittedAsset | UncommittedAsset): Asset {
     let assetValueToAsset = asset.value.committed
@@ -205,6 +207,11 @@ export class Asset extends BaseAsset implements IAsset {
     this.#asset = asset;
     assetValueToAsset.set(asset.value, this);
     return this;
+  }
+
+  get env(): IEnvironment {
+    this.#env ??= new Environment(this.#asset.value.env, this.#asset.options);
+    return this.#env;
   }
 
   get stats(): Stats {
@@ -270,6 +277,19 @@ export class MutableAsset extends BaseAsset implements IMutableAsset {
     this.#asset.value.sideEffects = sideEffects;
   }
 
+  get uniqueKey(): ?string {
+    return this.#asset.value.uniqueKey;
+  }
+
+  set uniqueKey(uniqueKey: ?string): void {
+    if (this.#asset.value.uniqueKey != null) {
+      throw new Error(
+        "Cannot change an asset's uniqueKey after it has been set.",
+      );
+    }
+    this.#asset.value.uniqueKey = uniqueKey;
+  }
+
   get symbols(): IMutableAssetSymbols {
     return new MutableAssetSymbols(this.#asset.options, this.#asset.value);
   }
@@ -290,6 +310,14 @@ export class MutableAsset extends BaseAsset implements IMutableAsset {
 
   invalidateOnEnvChange(env: string): void {
     this.#asset.invalidateOnEnvChange(env);
+  }
+
+  invalidateOnStartup(): void {
+    this.#asset.invalidateOnStartup();
+  }
+
+  invalidateOnBuild(): void {
+    this.#asset.invalidateOnBuild();
   }
 
   isASTDirty(): boolean {

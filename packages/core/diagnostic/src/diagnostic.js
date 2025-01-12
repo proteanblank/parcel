@@ -2,7 +2,7 @@
 
 import invariant from 'assert';
 import nullthrows from 'nullthrows';
-import jsonMap, {type Mapping} from 'json-source-map';
+import {parse, type Mapping} from '@mischnic/json-sourcemap';
 
 /** These positions are 1-based (so <code>1</code> is the first line/column) */
 export type DiagnosticHighlightLocation = {|
@@ -46,6 +46,12 @@ export type DiagnosticCodeFrame = {|
   codeHighlights: Array<DiagnosticCodeHighlight>,
 |};
 
+/** A JSON object (as in "map") */
+type JSONObject = {
+  // $FlowFixMe
+  [key: string]: any,
+};
+
 /**
  * A style agnostic way of emitting errors, warnings and info.
  * Reporters are responsible for rendering the message, codeframes, hints, ...
@@ -69,6 +75,12 @@ export type Diagnostic = {|
 
   /** @private */
   skipFormatting?: boolean,
+
+  /** A URL to documentation to learn more about the diagnostic. */
+  documentationURL?: string,
+
+  /** Diagnostic specific metadata (optional) */
+  meta?: JSONObject,
 |};
 
 // This type should represent all error formats Parcel can encounter...
@@ -102,7 +114,7 @@ export type Diagnostifiable =
 /** Normalize the given value into a diagnostic. */
 export function anyToDiagnostic(input: Diagnostifiable): Array<Diagnostic> {
   if (Array.isArray(input)) {
-    return input;
+    return input.flatMap(e => anyToDiagnostic(e));
   } else if (input instanceof ThrowableDiagnostic) {
     return input.diagnostics;
   } else if (input instanceof Error) {
@@ -174,7 +186,10 @@ export function errorToDiagnostic(
       origin: defaultValues?.origin ?? 'Error',
       message: escapeMarkdown(error.message),
       name: error.name,
-      stack: error.highlightedCodeFrame ?? error.codeFrame ?? error.stack,
+      stack:
+        codeFrames == null
+          ? error.highlightedCodeFrame ?? error.codeFrame ?? error.stack
+          : undefined,
       codeFrames,
     },
   ];
@@ -209,8 +224,8 @@ export default class ThrowableDiagnostic extends Error {
 }
 
 /**
- * Turns a list of positions in a JSON file with messages into a list of diagnostics.
- * Uses <a href="https://github.com/epoberezkin/json-source-map">epoberezkin/json-source-map</a>.
+ * Turns a list of positions in a JSON5 file with messages into a list of diagnostics.
+ * Uses <a href="https://github.com/mischnic/json-sourcemap">@mischnic/json-sourcemap</a>.
  *
  * @param code the JSON code
  * @param ids A list of JSON keypaths (<code>key: "/some/parent/child"</code>) with corresponding messages, \
@@ -225,40 +240,43 @@ export function generateJSONCodeHighlights(
       |},
   ids: Array<{|key: string, type?: ?'key' | 'value', message?: string|}>,
 ): Array<DiagnosticCodeHighlight> {
-  // json-source-map doesn't support a tabWidth option (yet)
   let map =
-    typeof data == 'string' ? jsonMap.parse(data.replace(/\t/g, ' ')) : data;
+    typeof data == 'string'
+      ? parse(data, undefined, {dialect: 'JSON5', tabWidth: 1})
+      : data;
   return ids.map(({key, type, message}) => {
     let pos = nullthrows(map.pointers[key]);
     return {
-      ...getJSONSourceLocation(pos, type),
+      ...getJSONHighlightLocation(pos, type),
       message,
     };
   });
 }
 
 /**
- * Converts entries in <a href="https://github.com/epoberezkin/json-source-map">epoberezkin/json-source-map</a>'s
+ * Converts entries in <a href="https://github.com/mischnic/json-sourcemap">@mischnic/json-sourcemap</a>'s
  * <code>result.pointers</code> array.
  */
-export function getJSONSourceLocation(
+export function getJSONHighlightLocation(
   pos: Mapping,
   type?: ?'key' | 'value',
 ): {|
   start: DiagnosticHighlightLocation,
   end: DiagnosticHighlightLocation,
 |} {
-  if (!type && pos.key && pos.value) {
+  let key = 'key' in pos ? pos.key : undefined;
+  let keyEnd = 'keyEnd' in pos ? pos.keyEnd : undefined;
+  if (!type && key && pos.value) {
     // key and value
     return {
-      start: {line: pos.key.line + 1, column: pos.key.column + 1},
+      start: {line: key.line + 1, column: key.column + 1},
       end: {line: pos.valueEnd.line + 1, column: pos.valueEnd.column},
     };
   } else if (type == 'key' || !pos.value) {
-    invariant(pos.key && pos.keyEnd);
+    invariant(key && keyEnd);
     return {
-      start: {line: pos.key.line + 1, column: pos.key.column + 1},
-      end: {line: pos.keyEnd.line + 1, column: pos.keyEnd.column},
+      start: {line: key.line + 1, column: key.column + 1},
+      end: {line: keyEnd.line + 1, column: keyEnd.column},
     };
   } else {
     return {
@@ -268,9 +286,45 @@ export function getJSONSourceLocation(
   }
 }
 
+/** Result is 1-based, but end is exclusive */
+export function getJSONSourceLocation(
+  pos: Mapping,
+  type?: ?'key' | 'value',
+): {|
+  start: {|
+    +line: number,
+    +column: number,
+  |},
+  end: {|
+    +line: number,
+    +column: number,
+  |},
+|} {
+  let v = getJSONHighlightLocation(pos, type);
+  return {start: v.start, end: {line: v.end.line, column: v.end.column + 1}};
+}
+
+export function convertSourceLocationToHighlight<
+  Location: {
+    /** 1-based, inclusive */
+    +start: {|
+      +line: number,
+      +column: number,
+    |},
+    /** 1-based, exclusive */
+    +end: {|
+      +line: number,
+      +column: number,
+    |},
+    ...
+  },
+>({start, end}: Location, message?: string): DiagnosticCodeHighlight {
+  return {message, start, end: {line: end.line, column: end.column - 1}};
+}
+
 /** Sanitizes object keys before using them as <code>key</code> in generateJSONCodeHighlights */
 export function encodeJSONKeyComponent(component: string): string {
-  return component.replace(/\//g, '~1');
+  return component.replace(/~/g, '~0').replace(/\//g, '~1');
 }
 
 const escapeCharacters = ['\\', '*', '_', '~'];
@@ -293,28 +347,39 @@ export function md(
 ): string {
   let result = [];
   for (let i = 0; i < params.length; i++) {
+    result.push(strings[i]);
+
     let param = params[i];
-    result.push(strings[i], param?.[mdVerbatim] ?? escapeMarkdown(`${param}`));
+    if (Array.isArray(param)) {
+      for (let j = 0; j < param.length; j++) {
+        result.push(param[j]?.[mdVerbatim] ?? escapeMarkdown(`${param[j]}`));
+        if (j < param.length - 1) {
+          result.push(', ');
+        }
+      }
+    } else {
+      result.push(param?.[mdVerbatim] ?? escapeMarkdown(`${param}`));
+    }
   }
   return result.join('') + strings[strings.length - 1];
 }
 
-md.bold = function(s: TemplateInput): TemplateInput {
+md.bold = function (s: TemplateInput): TemplateInput {
   // $FlowFixMe[invalid-computed-prop]
   return {[mdVerbatim]: '**' + escapeMarkdown(`${s}`) + '**'};
 };
 
-md.italic = function(s: TemplateInput): TemplateInput {
+md.italic = function (s: TemplateInput): TemplateInput {
   // $FlowFixMe[invalid-computed-prop]
   return {[mdVerbatim]: '_' + escapeMarkdown(`${s}`) + '_'};
 };
 
-md.underline = function(s: TemplateInput): TemplateInput {
+md.underline = function (s: TemplateInput): TemplateInput {
   // $FlowFixMe[invalid-computed-prop]
   return {[mdVerbatim]: '__' + escapeMarkdown(`${s}`) + '__'};
 };
 
-md.strikethrough = function(s: TemplateInput): TemplateInput {
+md.strikethrough = function (s: TemplateInput): TemplateInput {
   // $FlowFixMe[invalid-computed-prop]
   return {[mdVerbatim]: '~~' + escapeMarkdown(`${s}`) + '~~'};
 };

@@ -5,7 +5,8 @@ import SourceMap from '@parcel/source-map';
 import path from 'path';
 import {normalizeSeparators, isAbsolute} from './path';
 
-export const SOURCEMAP_RE: RegExp = /(?:\/\*|\/\/)\s*[@#]\s*sourceMappingURL\s*=\s*([^\s*]+)(?:\s*\*\/)?\s*$/;
+export const SOURCEMAP_RE: RegExp =
+  /(?:\/\*|\/\/)\s*[@#]\s*sourceMappingURL\s*=\s*([^\s*]+)(?:\s*\*\/)?\s*$/;
 const DATA_URL_RE = /^data:[^;]+(?:;charset=[^;]+)?;base64,(.*)/;
 export const SOURCEMAP_EXTENSIONS: Set<string> = new Set<string>([
   'css',
@@ -93,8 +94,8 @@ export function remapSourceLocation(
   } = loc;
   let lineDiff = endLine - startLine;
   let colDiff = endCol - startCol;
-  let start = originalMap.findClosestMapping(startLine, startCol);
-  let end = originalMap.findClosestMapping(endLine, endCol);
+  let start = originalMap.findClosestMapping(startLine, startCol - 1);
+  let end = originalMap.findClosestMapping(endLine, endCol - 1);
 
   if (start?.original) {
     if (start.source) {
@@ -107,13 +108,16 @@ export function remapSourceLocation(
 
   if (end?.original) {
     ({line: endLine, column: endCol} = end.original);
-    endCol++;
+    endCol++; // source map columns are 0-based
 
     if (endLine < startLine) {
       endLine = startLine;
       endCol = startCol;
     } else if (endLine === startLine && endCol < startCol && lineDiff === 0) {
       endCol = startCol + colDiff;
+    } else if (endLine === startLine && startCol === endCol && lineDiff === 0) {
+      // Prevent 0-length ranges
+      endCol = startCol + 1;
     }
   } else {
     endLine = startLine;

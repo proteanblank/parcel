@@ -29,7 +29,15 @@ const metadataContent = new Set([
 export default (new Packager({
   async loadConfig({config}) {
     let posthtmlConfig = await config.getConfig(
-      ['.posthtmlrc', '.posthtmlrc.js', 'posthtml.config.js'],
+      [
+        '.posthtmlrc',
+        '.posthtmlrc.js',
+        '.posthtmlrc.cjs',
+        '.posthtmlrc.mjs',
+        'posthtml.config.js',
+        'posthtml.config.cjs',
+        'posthtml.config.mjs',
+      ],
       {
         packageKey: 'posthtml',
       },
@@ -60,19 +68,21 @@ export default (new Packager({
     let renderConfig = config?.render;
 
     let {html} = await posthtml([
-      insertBundleReferences.bind(this, referencedBundles),
-      replaceInlineAssetContent.bind(
-        this,
-        bundleGraph,
-        getInlineBundleContents,
-      ),
-    ]).process(code, renderConfig);
+      tree => insertBundleReferences(referencedBundles, tree),
+      tree =>
+        replaceInlineAssetContent(bundleGraph, getInlineBundleContents, tree),
+    ]).process(code, {
+      ...renderConfig,
+      xmlMode: bundle.type === 'xhtml',
+      closingSingleTag: bundle.type === 'xhtml' ? 'slash' : undefined,
+    });
 
     let {contents, map} = replaceURLReferences({
       bundle,
       bundleGraph,
       contents: html,
       relative: false,
+      getReplacement: contents => contents.replace(/"/g, '&quot;'),
     });
 
     return replaceInlineReferences({
@@ -137,9 +147,8 @@ async function replaceInlineAssetContent(
 
     if (newContent != null) {
       let {contents, bundle} = newContent;
-      node.content = (contents instanceof Readable
-        ? await bufferStream(contents)
-        : contents
+      node.content = (
+        contents instanceof Readable ? await bufferStream(contents) : contents
       ).toString();
 
       if (

@@ -9,11 +9,13 @@ export class TSModuleGraph {
   modules: Map<string, TSModule>;
   mainModuleName: string;
   mainModule: ?TSModule;
+  syntheticImportCount: number;
 
   constructor(mainModuleName: string) {
     this.modules = new Map();
     this.mainModuleName = mainModuleName;
     this.mainModule = null;
+    this.syntheticImportCount = 0;
   }
 
   addModule(name: string, module: TSModule) {
@@ -64,9 +66,11 @@ export class TSModuleGraph {
       return ts.visitEachChild(node, visit, context);
     };
 
-    let node = module.bindings.get(name);
-    if (node) {
-      ts.visitEachChild(node, visit, context);
+    let bindings = module.bindings.get(name);
+    if (bindings) {
+      for (let node of bindings) {
+        ts.visitEachChild(node, visit, context);
+      }
     }
   }
 
@@ -141,10 +145,13 @@ export class TSModuleGraph {
       if (e.name === name) {
         return this.getExport(module, e);
       } else if (e.specifier) {
-        return this.resolveExport(
+        const m = this.resolveExport(
           nullthrows(this.getModule(e.specifier)),
           name,
         );
+        if (m) {
+          return m;
+        }
       }
     }
   }

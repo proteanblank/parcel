@@ -16,6 +16,8 @@ import {
 import {validatePackageName} from '../src/ParcelConfig.schema';
 import {DEFAULT_OPTIONS, relative} from './test-utils';
 import {toProjectPath} from '../src/projectPath';
+import json5 from 'json5';
+import fs from 'fs';
 
 describe('ParcelConfigRequest', () => {
   describe('validatePackageName', () => {
@@ -77,6 +79,15 @@ describe('ParcelConfigRequest', () => {
         'transform',
         'transformers',
       );
+    });
+
+    it('should succeed on a local package', () => {
+      validatePackageName(
+        './parcel-transform-bar',
+        'transform',
+        'transformers',
+      );
+      validatePackageName('./bar', 'transform', 'transformers');
     });
   });
 
@@ -300,9 +311,12 @@ describe('ParcelConfigRequest', () => {
     });
 
     it('should throw error on empty config file', () => {
-      assert.throws(() => {
-        validateConfigFile({}, '.parcelrc');
-      }, /.parcelrc can't be empty/);
+      assert.throws(
+        () => {
+          validateConfigFile({}, '.parcelrc');
+        },
+        {name: 'Error', message: ".parcelrc can't be empty"},
+      );
     });
   });
 
@@ -643,6 +657,7 @@ describe('ParcelConfigRequest', () => {
         runtimes: [],
         namers: [],
         optimizers: {},
+        compressors: {},
         packagers: {},
         reporters: [],
         validators: {},
@@ -683,7 +698,7 @@ describe('ParcelConfigRequest', () => {
       let defaultConfigPath = require.resolve('@parcel/config-default');
       let defaultConfig = await processConfig(
         {
-          ...require('@parcel/config-default'),
+          ...json5.parse(fs.readFileSync(defaultConfigPath, 'utf8')),
           filePath: defaultConfigPath,
         },
         DEFAULT_OPTIONS,
@@ -802,6 +817,45 @@ describe('ParcelConfigRequest', () => {
                         '"./.parclrc-node-modules" does not exist, did you mean "./.parcelrc-node-modules"?',
                       start: {line: 2, column: 14},
                       end: {line: 2, column: 38},
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      );
+    });
+
+    it('should emit a codeframe when an extended parcel config file is not found in JSON5', async () => {
+      let configFilePath = path.join(
+        __dirname,
+        'fixtures',
+        'config-extends-not-found',
+        '.parcelrc-json5',
+      );
+      let code = await DEFAULT_OPTIONS.inputFS.readFile(configFilePath, 'utf8');
+
+      // $FlowFixMe[prop-missing]
+      await assert.rejects(
+        () => parseAndProcessConfig(configFilePath, code, DEFAULT_OPTIONS),
+        {
+          name: 'Error',
+          diagnostics: [
+            {
+              message: 'Cannot find extended parcel config',
+              origin: '@parcel/core',
+              codeFrames: [
+                {
+                  filePath: configFilePath,
+                  language: 'json5',
+                  code,
+                  codeHighlights: [
+                    {
+                      message:
+                        '"./.parclrc-node-modules" does not exist, did you mean "./.parcelrc-node-modules"?',
+                      start: {line: 2, column: 12},
+                      end: {line: 2, column: 36},
                     },
                   ],
                 },

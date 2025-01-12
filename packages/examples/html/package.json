@@ -1,6 +1,6 @@
 {
   "name": "@parcel/html-example",
-  "version": "2.0.0-rc.0",
+  "version": "2.13.3",
   "license": "MIT",
   "private": true,
   "scripts": {
@@ -12,12 +12,13 @@
     "not firefox < 67"
   ],
   "devDependencies": {
-    "@parcel/babel-register": "2.0.0-rc.0",
-    "parcel": "2.0.0-rc.0"
+    "@babel/core": "^7.22.11",
+    "@parcel/babel-register": "2.13.3",
+    "parcel": "2.13.3"
   },
   "dependencies": {
     "lodash": "^4.17.11",
-    "react": "^16.6.3",
-    "react-dom": "^16.6.3"
+    "react": "^19",
+    "react-dom": "^19"
   }
 }

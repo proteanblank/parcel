@@ -4,41 +4,41 @@ import {Transformer} from '@parcel/plugin';
 
 import path from 'path';
 import posthtml from 'posthtml';
-import parse from 'posthtml-parser';
-import render from 'posthtml-render';
+import {parser as parse} from 'posthtml-parser';
+import {render} from 'posthtml-render';
 import nullthrows from 'nullthrows';
 import semver from 'semver';
-import {relativePath} from '@parcel/utils';
 import loadPlugins from './loadPlugins';
 
 export default (new Transformer({
   async loadConfig({config, options, logger}) {
+    if (!config.isSource) {
+      return;
+    }
+
     let configFile = await config.getConfig(
-      ['.posthtmlrc', '.posthtmlrc.js', 'posthtml.config.js'],
+      [
+        '.posthtmlrc',
+        '.posthtmlrc.js',
+        '.posthtmlrc.cjs',
+        '.posthtmlrc.mjs',
+        'posthtml.config.js',
+        'posthtml.config.cjs',
+        'posthtml.config.mjs',
+      ],
       {
         packageKey: 'posthtml',
       },
     );
 
     if (configFile) {
-      let isJavascript = path.extname(configFile.filePath) === '.js';
+      let isJavascript = path.extname(configFile.filePath).endsWith('js');
       if (isJavascript) {
         // We have to invalidate on startup in case the config is non-deterministic,
         // e.g. using unknown environment variables, reading from the filesystem, etc.
         logger.warn({
           message:
             'WARNING: Using a JavaScript PostHTML config file means losing out on caching features of Parcel. Use a .posthtmlrc (JSON) file whenever possible.',
-        });
-
-        config.invalidateOnStartup();
-
-        // Also add the config as a dev dependency so we attempt to reload in watch mode.
-        config.addDevDependency({
-          specifier: relativePath(
-            path.dirname(config.searchPath),
-            configFile.filePath,
-          ),
-          resolveFrom: config.searchPath,
         });
       }
 
@@ -88,6 +88,7 @@ export default (new Transformer({
       program: parse(await asset.getCode(), {
         lowerCaseAttributeNames: true,
         sourceLocations: true,
+        xmlMode: asset.type === 'xhtml',
       }),
     };
   },
@@ -104,14 +105,11 @@ export default (new Transformer({
     });
 
     if (res.messages) {
-      await Promise.all(
-        res.messages.map(({type, file: filePath}) => {
-          if (type === 'dependency') {
-            return asset.invalidateOnFileChange(filePath);
-          }
-          return Promise.resolve();
-        }),
-      );
+      for (let {type, file: filePath} of res.messages) {
+        if (type === 'dependency') {
+          asset.invalidateOnFileChange(filePath);
+        }
+      }
     }
 
     asset.setAST({
@@ -123,9 +121,11 @@ export default (new Transformer({
     return [asset];
   },
 
-  generate({ast}) {
+  generate({ast, asset}) {
     return {
-      content: render(ast.program),
+      content: render(ast.program, {
+        closingSingleTag: asset.type === 'xhtml' ? 'slash' : undefined,
+      }),
     };
   },
 }): Transformer);

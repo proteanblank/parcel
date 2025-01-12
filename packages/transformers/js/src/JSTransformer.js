@@ -1,27 +1,37 @@
 // @flow
-import type {JSONObject, EnvMap} from '@parcel/types';
+import type {
+  JSONObject,
+  EnvMap,
+  SourceLocation,
+  FilePath,
+  FileCreateInvalidation,
+} from '@parcel/types';
 import type {SchemaEntity} from '@parcel/utils';
+import type {Diagnostic} from '@parcel/diagnostic';
 import SourceMap from '@parcel/source-map';
 import {Transformer} from '@parcel/plugin';
-import {init, transform} from '../native';
-import path from 'path';
+import {transform, transformAsync} from '@parcel/rust';
 import browserslist from 'browserslist';
 import semver from 'semver';
 import nullthrows from 'nullthrows';
-import ThrowableDiagnostic, {encodeJSONKeyComponent} from '@parcel/diagnostic';
-import {validateSchema, remapSourceLocation} from '@parcel/utils';
-import {isMatch} from 'micromatch';
+import invariant from 'assert';
+import ThrowableDiagnostic, {
+  encodeJSONKeyComponent,
+  convertSourceLocationToHighlight,
+} from '@parcel/diagnostic';
+import {validateSchema, remapSourceLocation, globMatch} from '@parcel/utils';
+import pkg from '../package.json';
 
 const JSX_EXTENSIONS = {
-  '.jsx': true,
-  '.tsx': true,
+  jsx: true,
+  tsx: true,
 };
 
 const JSX_PRAGMA = {
   react: {
     pragma: 'React.createElement',
     pragmaFrag: 'React.Fragment',
-    automatic: '>= 17.0.0',
+    automatic: '>= 17.0.0 || ^16.14.0 || >= 0.0.0-0 < 0.0.0',
   },
   preact: {
     pragma: 'h',
@@ -97,16 +107,12 @@ const CONFIG_SCHEMA: SchemaEntity = {
         },
       ],
     },
+    unstable_inlineConstants: {
+      type: 'boolean',
+    },
   },
   additionalProperties: false,
 };
-
-type PackageJSONConfig = {|
-  '@parcel/transformer-js'?: {|
-    inlineFS?: boolean,
-    inlineEnvironment?: boolean | Array<string>,
-  |},
-|};
 
 const SCRIPT_ERRORS = {
   browser: {
@@ -116,16 +122,19 @@ const SCRIPT_ERRORS = {
   'web-worker': {
     message:
       'Web workers cannot have imports or exports without the `type: "module"` option.',
-    hint:
-      "Add {type: 'module'} as a second argument to the Worker constructor.",
+    hint: "Add {type: 'module'} as a second argument to the Worker constructor.",
   },
   'service-worker': {
     message:
       'Service workers cannot have imports or exports without the `type: "module"` option.',
-    hint:
-      "Add {type: 'module'} as a second argument to the navigator.serviceWorker.register() call.",
+    hint: "Add {type: 'module'} as a second argument to the navigator.serviceWorker.register() call.",
   },
 };
+
+const OPTIONAL = 1 << 0;
+const HELPER = 1 << 1;
+const NEEDS_STABLE_NAME = 1 << 2;
+const REACT_LAZY = 1 << 3;
 
 type TSConfig = {
   compilerOptions?: {
@@ -139,10 +148,29 @@ type TSConfig = {
     jsxImportSource?: string,
     // https://www.typescriptlang.org/tsconfig#experimentalDecorators
     experimentalDecorators?: boolean,
+    // https://www.typescriptlang.org/tsconfig#useDefineForClassFields
+    useDefineForClassFields?: boolean,
+    // https://www.typescriptlang.org/tsconfig#target
+    target?: string, // 'es3' | 'es5' | 'es6' | 'es2015' | ...  |'es2022' | ... | 'esnext'
     ...
   },
   ...
 };
+
+type MacroAsset = {|
+  type: string,
+  content: string,
+|};
+
+// NOTE: Make sure this is in sync with the TypeScript definition in the @parcel/macros package.
+type MacroContext = {|
+  addAsset(asset: MacroAsset): void,
+  invalidateOnFileChange(FilePath): void,
+  invalidateOnFileCreate(FileCreateInvalidation): void,
+  invalidateOnEnvChange(string): void,
+  invalidateOnStartup(): void,
+  invalidateOnBuild(): void,
+|};
 
 export default (new Transformer({
   async loadConfig({config, options}) {
@@ -153,7 +181,8 @@ export default (new Transformer({
       jsxImportSource,
       automaticJSXRuntime,
       reactRefresh,
-      decorators;
+      decorators,
+      useDefineForClassFields;
     if (config.isSource) {
       let reactLib;
       if (pkg?.alias && pkg.alias['react']) {
@@ -200,13 +229,20 @@ export default (new Transformer({
         jsxImportSource = compilerOptions?.jsxImportSource;
         automaticJSXRuntime = true;
       } else if (reactLib) {
-        let automaticVersion = JSX_PRAGMA[reactLib]?.automatic;
+        let effectiveReactLib =
+          pkg?.alias && pkg.alias['react'] === 'preact/compat'
+            ? 'preact'
+            : reactLib;
+        let automaticVersion = JSX_PRAGMA[effectiveReactLib]?.automatic;
         let reactLibVersion =
-          pkg?.dependencies?.[reactLib] ||
-          pkg?.devDependencies?.[reactLib] ||
-          pkg?.peerDependencies?.[reactLib];
+          pkg?.dependencies?.[effectiveReactLib] ||
+          pkg?.devDependencies?.[effectiveReactLib] ||
+          pkg?.peerDependencies?.[effectiveReactLib];
+        reactLibVersion = reactLibVersion
+          ? semver.validRange(reactLibVersion)
+          : null;
         let minReactLibVersion =
-          reactLibVersion != null && reactLibVersion !== '*'
+          reactLibVersion !== null && reactLibVersion !== '*'
             ? semver.minVersion(reactLibVersion)?.toString()
             : null;
 
@@ -214,20 +250,30 @@ export default (new Transformer({
           automaticVersion &&
           !compilerOptions?.jsxFactory &&
           minReactLibVersion != null &&
-          semver.satisfies(minReactLibVersion, automaticVersion);
+          semver.satisfies(minReactLibVersion, automaticVersion, {
+            includePrerelease: true,
+          });
 
         if (automaticJSXRuntime) {
           jsxImportSource = reactLib;
         }
       }
 
-      isJSX = Boolean(
-        compilerOptions?.jsx ||
-          pragma ||
-          JSX_EXTENSIONS[path.extname(config.searchPath)],
-      );
-
+      isJSX = Boolean(compilerOptions?.jsx || pragma);
       decorators = compilerOptions?.experimentalDecorators;
+      useDefineForClassFields = compilerOptions?.useDefineForClassFields;
+      if (
+        useDefineForClassFields === undefined &&
+        compilerOptions?.target != null
+      ) {
+        // Default useDefineForClassFields to true if target is ES2022 or higher (including ESNext)
+        let target = compilerOptions.target.slice(2);
+        if (target === 'next') {
+          useDefineForClassFields = true;
+        } else {
+          useDefineForClassFields = Number(target) >= 2022;
+        }
+      }
     }
 
     // Check if we should ignore fs calls
@@ -238,22 +284,21 @@ export default (new Transformer({
       typeof pkg.browser === 'object' &&
       pkg.browser.fs === false;
 
-    let result = await config.getConfigFrom<PackageJSONConfig>(
-      path.join(options.projectRoot, 'index'),
-      ['package.json'],
-    );
-    let rootPkg = result?.contents;
+    let conf = await config.getConfigFrom(options.projectRoot + '/index', [], {
+      packageKey: '@parcel/transformer-js',
+    });
 
     let inlineEnvironment = config.isSource;
     let inlineFS = !ignoreFS;
-    if (result && rootPkg?.['@parcel/transformer-js']) {
+    let inlineConstants = false;
+    if (conf && conf.contents) {
       validateSchema.diagnostic(
         CONFIG_SCHEMA,
         {
-          data: rootPkg['@parcel/transformer-js'],
+          data: conf.contents,
           // FIXME
-          source: await options.inputFS.readFile(result.filePath, 'utf8'),
-          filePath: result.filePath,
+          source: await options.inputFS.readFile(conf.filePath, 'utf8'),
+          filePath: conf.filePath,
           prependKey: `/${encodeJSONKeyComponent('@parcel/transformer-js')}`,
         },
         // FIXME
@@ -261,10 +306,10 @@ export default (new Transformer({
         'Invalid config for @parcel/transformer-js',
       );
 
-      inlineEnvironment =
-        rootPkg['@parcel/transformer-js']?.inlineEnvironment ??
-        inlineEnvironment;
-      inlineFS = rootPkg['@parcel/transformer-js']?.inlineFS ?? inlineFS;
+      inlineEnvironment = conf.contents?.inlineEnvironment ?? inlineEnvironment;
+      inlineFS = conf.contents?.inlineFS ?? inlineFS;
+      inlineConstants =
+        conf.contents?.unstable_inlineConstants ?? inlineConstants;
     }
 
     return {
@@ -275,61 +320,60 @@ export default (new Transformer({
       pragmaFrag,
       inlineEnvironment,
       inlineFS,
+      inlineConstants,
       reactRefresh,
       decorators,
+      useDefineForClassFields,
     };
   },
   async transform({asset, config, options, logger}) {
     let [code, originalMap] = await Promise.all([
       asset.getBuffer(),
       asset.getMap(),
-      init,
     ]);
 
     let targets;
-    if (asset.isSource) {
-      if (asset.env.isElectron() && asset.env.engines.electron) {
-        targets = {
-          electron: semver.minVersion(asset.env.engines.electron)?.toString(),
-        };
-      } else if (asset.env.isBrowser() && asset.env.engines.browsers) {
-        targets = {};
+    if (asset.env.isElectron() && asset.env.engines.electron) {
+      targets = {
+        electron: semver.minVersion(asset.env.engines.electron)?.toString(),
+      };
+    } else if (asset.env.isBrowser() && asset.env.engines.browsers) {
+      targets = {};
 
-        let browsers = Array.isArray(asset.env.engines.browsers)
-          ? asset.env.engines.browsers
-          : [asset.env.engines.browsers];
+      let browsers = Array.isArray(asset.env.engines.browsers)
+        ? asset.env.engines.browsers
+        : [asset.env.engines.browsers];
 
-        // If the output format is esmodule, exclude browsers
-        // that support them natively so that we transpile less.
-        if (asset.env.outputFormat === 'esmodule') {
-          browsers = [...browsers, ...ESMODULE_BROWSERS];
-        }
-
-        browsers = browserslist(browsers);
-        for (let browser of browsers) {
-          let [name, version] = browser.split(' ');
-          if (BROWSER_MAPPING.hasOwnProperty(name)) {
-            name = BROWSER_MAPPING[name];
-            if (!name) {
-              continue;
-            }
-          }
-
-          let [major, minor = '0', patch = '0'] = version
-            .split('-')[0]
-            .split('.');
-          let semverVersion = `${major}.${minor}.${patch}`;
-
-          if (
-            targets[name] == null ||
-            semver.gt(targets[name], semverVersion)
-          ) {
-            targets[name] = semverVersion;
-          }
-        }
-      } else if (asset.env.isNode() && asset.env.engines.node) {
-        targets = {node: semver.minVersion(asset.env.engines.node)?.toString()};
+      // If the output format is esmodule, exclude browsers
+      // that support them natively so that we transpile less.
+      if (asset.env.outputFormat === 'esmodule') {
+        browsers = [...browsers, ...ESMODULE_BROWSERS];
       }
+
+      browsers = browserslist(browsers);
+      for (let browser of browsers) {
+        let [name, version] = browser.split(' ');
+        if (BROWSER_MAPPING.hasOwnProperty(name)) {
+          name = BROWSER_MAPPING[name];
+          if (!name) {
+            continue;
+          }
+        }
+
+        let [major, minor = '0', patch = '0'] = version
+          .split('-')[0]
+          .split('.');
+        if (isNaN(major) || isNaN(minor) || isNaN(patch)) {
+          continue;
+        }
+        let semverVersion = `${major}.${minor}.${patch}`;
+
+        if (targets[name] == null || semver.gt(targets[name], semverVersion)) {
+          targets[name] = semverVersion;
+        }
+      }
+    } else if (asset.env.isNode() && asset.env.engines.node) {
+      targets = {node: semver.minVersion(asset.env.engines.node)?.toString()};
     }
 
     let env: EnvMap = {};
@@ -343,10 +387,11 @@ export default (new Transformer({
         env.PARCEL_BUILD_ENV = 'test';
       }
     } else if (Array.isArray(config?.inlineEnvironment)) {
-      for (let key in options.env) {
-        if (isMatch(key, config.inlineEnvironment)) {
-          env[key] = String(options.env[key]);
-        }
+      for (let match of globMatch(
+        Object.keys(options.env),
+        config.inlineEnvironment,
+      )) {
+        env[match] = String(options.env[match]);
       }
     } else {
       for (let key in options.env) {
@@ -358,39 +403,55 @@ export default (new Transformer({
 
     let supportsModuleWorkers =
       asset.env.shouldScopeHoist && asset.env.supports('worker-module', true);
+    let isJSX = Boolean(config?.isJSX);
+    if (asset.type === 'ts') {
+      isJSX = false;
+    } else if (!isJSX) {
+      isJSX = Boolean(JSX_EXTENSIONS[asset.type]);
+    }
+
+    let type = 'js';
+    if (asset.type === 'ts' || asset.type === 'tsx' || asset.type === 'mdx') {
+      type = asset.type;
+    } else if (isJSX) {
+      type = 'jsx';
+    }
+
+    let macroAssets = [];
     let {
       dependencies,
       code: compiledCode,
       map,
       shebang,
       hoist_result,
+      symbol_result,
       needs_esm_helpers,
       diagnostics,
       used_env,
-    } = transform({
+      has_node_replacements,
+      is_constant_module,
+      directives,
+      helpers,
+      mdx_exports,
+      mdx_toc,
+      mdx_assets,
+    } = await (transformAsync || transform)({
       filename: asset.filePath,
       code,
       module_id: asset.id,
       project_root: options.projectRoot,
-      replace_env: !asset.env.isNode(),
-      inline_fs: Boolean(config?.inlineFS) && !asset.env.isNode(),
-      insert_node_globals: !asset.env.isNode(),
-      is_browser: asset.env.isBrowser(),
-      is_worker: asset.env.isWorker(),
+      inline_fs: Boolean(config?.inlineFS),
+      context: asset.env.context,
       env,
-      is_type_script: asset.type === 'ts' || asset.type === 'tsx',
-      is_jsx: Boolean(config?.isJSX),
+      type,
       jsx_pragma: config?.pragma,
       jsx_pragma_frag: config?.pragmaFrag,
       automatic_jsx_runtime: Boolean(config?.automaticJSXRuntime),
       jsx_import_source: config?.jsxImportSource,
       is_development: options.mode === 'development',
-      react_refresh:
-        asset.env.isBrowser() &&
-        !asset.env.isWorker() &&
-        !asset.env.isWorklet() &&
-        Boolean(config?.reactRefresh),
+      react_refresh: Boolean(config?.reactRefresh),
       decorators: Boolean(config?.decorators),
+      use_define_for_class_fields: Boolean(config?.useDefineForClassFields),
       targets,
       source_maps: !!asset.env.sourceMap,
       scope_hoist:
@@ -399,9 +460,132 @@ export default (new Transformer({
       supports_module_workers: supportsModuleWorkers,
       is_library: asset.env.isLibrary,
       is_esm_output: asset.env.outputFormat === 'esmodule',
+      trace_bailouts: options.logLevel === 'verbose',
+      is_swc_helpers: /@swc[/\\]helpers/.test(asset.filePath),
+      standalone: asset.query.has('standalone'),
+      inline_constants: config.inlineConstants,
+      callMacro: asset.isSource
+        ? async (err, src, exportName, args, loc) => {
+            let mod;
+            try {
+              mod = await options.packageManager.require(src, asset.filePath);
+
+              // Default interop for CommonJS modules.
+              if (
+                exportName === 'default' &&
+                !mod.__esModule &&
+                // $FlowFixMe
+                Object.prototype.toString.call(config) !== '[object Module]'
+              ) {
+                mod = {default: mod};
+              }
+
+              if (!Object.hasOwnProperty.call(mod, exportName)) {
+                throw new Error(`"${src}" does not export "${exportName}".`);
+              }
+            } catch (err) {
+              throw {
+                kind: 1,
+                message: err.message,
+              };
+            }
+
+            try {
+              if (typeof mod[exportName] === 'function') {
+                let ctx: MacroContext = {
+                  // Allows macros to emit additional assets to add as dependencies (e.g. css).
+                  addAsset(a: MacroAsset) {
+                    let k = String(macroAssets.length);
+                    let map;
+                    if (asset.env.sourceMap) {
+                      // Generate a source map that maps each line of the asset to the original macro call.
+                      map = new SourceMap(options.projectRoot);
+                      let mappings = [];
+                      let line = 1;
+                      for (let i = 0; i <= a.content.length; i++) {
+                        if (i === a.content.length || a.content[i] === '\n') {
+                          mappings.push({
+                            generated: {
+                              line,
+                              column: 0,
+                            },
+                            source: asset.filePath,
+                            original: {
+                              line: loc.line,
+                              column: loc.col,
+                            },
+                          });
+                          line++;
+                        }
+                      }
+
+                      map.addIndexedMappings(mappings);
+                      if (originalMap) {
+                        map.extends(originalMap);
+                      } else {
+                        map.setSourceContent(asset.filePath, code.toString());
+                      }
+                    }
+
+                    macroAssets.push({
+                      type: a.type,
+                      content: a.content,
+                      map,
+                      uniqueKey: k,
+                    });
+
+                    asset.addDependency({
+                      specifier: k,
+                      specifierType: 'esm',
+                    });
+                  },
+                  invalidateOnFileChange(filePath) {
+                    asset.invalidateOnFileChange(filePath);
+                  },
+                  invalidateOnFileCreate(invalidation) {
+                    asset.invalidateOnFileCreate(invalidation);
+                  },
+                  invalidateOnEnvChange(env) {
+                    asset.invalidateOnEnvChange(env);
+                  },
+                  invalidateOnStartup() {
+                    asset.invalidateOnStartup();
+                  },
+                  invalidateOnBuild() {
+                    asset.invalidateOnBuild();
+                  },
+                };
+
+                return mod[exportName].apply(ctx, args);
+              } else {
+                throw new Error(
+                  `"${exportName}" in "${src}" is not a function.`,
+                );
+              }
+            } catch (err) {
+              // Remove parcel core from stack and build string so Rust can process errors more easily.
+              let stack = (err.stack || '').split('\n').slice(1);
+              let message = err.message;
+              for (let line of stack) {
+                if (line.includes(__filename)) {
+                  break;
+                }
+                message += '\n' + line;
+              }
+              throw {
+                kind: 2,
+                message,
+              };
+            }
+          }
+        : null,
     });
 
-    let convertLoc = loc => {
+    if (is_constant_module) {
+      asset.meta.isConstantModule = true;
+    }
+
+    let convertLoc = (loc): SourceLocation => {
       let location = {
         filePath: asset.filePath,
         start: {
@@ -440,34 +624,35 @@ export default (new Transformer({
           message = err?.message || SCRIPT_ERRORS.browser.message;
         }
 
-        let res = {
+        let res: Diagnostic = {
           message,
           codeFrames: [
             {
               filePath: asset.filePath,
-              codeHighlights: diagnostic.code_highlights?.map(highlight => {
-                let {start, end} = convertLoc(highlight.loc);
-                return {
-                  message: highlight.message,
-                  start,
-                  end,
-                };
-              }),
+              codeHighlights: diagnostic.code_highlights?.map(highlight =>
+                convertSourceLocationToHighlight(
+                  convertLoc(highlight.loc),
+                  highlight.message ?? undefined,
+                ),
+              ),
             },
           ],
           hints: diagnostic.hints,
         };
 
+        if (diagnostic.documentation_url) {
+          res.documentationURL = diagnostic.documentation_url;
+        }
+
         if (diagnostic.show_environment) {
           if (asset.env.loc && asset.env.loc.filePath !== asset.filePath) {
-            res.codeFrames.push({
+            res.codeFrames?.push({
               filePath: asset.env.loc.filePath,
               codeHighlights: [
-                {
-                  start: asset.env.loc.start,
-                  end: asset.env.loc.end,
-                  message: 'The environment was originally created here',
-                },
+                convertSourceLocationToHighlight(
+                  asset.env.loc,
+                  'The environment was originally created here',
+                ),
               ],
             });
           }
@@ -498,8 +683,113 @@ export default (new Transformer({
       asset.meta.interpreter = shebang;
     }
 
+    if (has_node_replacements) {
+      asset.meta.has_node_replacements = has_node_replacements;
+    }
+
+    if (asset.type === 'mdx') {
+      asset.meta.ssgMeta = {
+        exports: mdx_exports,
+        tableOfContents: mdx_toc,
+      };
+
+      for (let [i, mdxAsset] of mdx_assets.entries()) {
+        let map;
+        if (asset.env.sourceMap && mdxAsset.position) {
+          // Generate a source map that maps each line of the asset to the original code block.
+          map = new SourceMap(options.projectRoot);
+          let mappings = [];
+          let line = 1;
+          let column = mdxAsset.position.start.column;
+          for (
+            let i = mdxAsset.position.start.line + 1;
+            i < mdxAsset.position.end.line;
+            i++
+          ) {
+            mappings.push({
+              generated: {
+                line,
+                column: 0,
+              },
+              source: asset.filePath,
+              original: {
+                line: i,
+                column,
+              },
+            });
+            line++;
+            column = 0;
+          }
+
+          map.addIndexedMappings(mappings);
+          if (originalMap) {
+            map.extends(originalMap);
+          } else {
+            map.setSourceContent(asset.filePath, code.toString());
+          }
+        }
+
+        macroAssets.push({
+          type: mdxAsset.lang,
+          content: mdxAsset.code,
+          map,
+          uniqueKey: 'mdx-' + i,
+        });
+      }
+    }
+
     for (let env of used_env) {
       asset.invalidateOnEnvChange(env);
+    }
+
+    asset.meta.id = asset.id;
+    asset.meta.directives = directives;
+    asset.meta.usedHelpers = helpers;
+    if (
+      asset.env.isServer() &&
+      !asset.env.isLibrary &&
+      (directives.includes('use client') ||
+        directives.includes('use client-entry'))
+    ) {
+      asset.setEnvironment({
+        context: 'react-client',
+        sourceType: 'module',
+        outputFormat: 'esmodule',
+        engines: asset.env.engines,
+        includeNodeModules: true,
+        isLibrary: false,
+        sourceMap: asset.env.sourceMap,
+        shouldOptimize: asset.env.shouldOptimize,
+        shouldScopeHoist: asset.env.shouldScopeHoist,
+      });
+    } else if (
+      !asset.env.isServer() &&
+      !asset.env.isLibrary &&
+      directives.includes('use server')
+    ) {
+      asset.setEnvironment({
+        context: 'react-server',
+        sourceType: 'module',
+        outputFormat: 'commonjs',
+        engines: asset.env.engines,
+        includeNodeModules: false,
+        isLibrary: false,
+        sourceMap: asset.env.sourceMap,
+        shouldOptimize: asset.env.shouldOptimize,
+        shouldScopeHoist: asset.env.shouldScopeHoist,
+      });
+    } else if (directives.includes('use server-entry')) {
+      if (!asset.env.isServer()) {
+        throw new Error(
+          'use server-entry must be imported in a server environment',
+        );
+      }
+      asset.bundleBehavior = 'isolated';
+    }
+
+    // Server actions must always be wrapped so they can be parcelRequired.
+    if (directives.includes('use server')) {
+      asset.meta.shouldWrap = true;
     }
 
     for (let dep of dependencies) {
@@ -562,16 +852,24 @@ export default (new Transformer({
             placeholder: dep.placeholder,
           },
         });
-      } else if (dep.kind === 'URL') {
+      } else if (dep.kind === 'Url') {
         asset.addURLDependency(dep.specifier, {
           bundleBehavior: 'isolated',
           loc: convertLoc(dep.loc),
+          needsStableName: Boolean(dep.flags & NEEDS_STABLE_NAME),
           meta: {
             placeholder: dep.placeholder,
           },
         });
       } else if (dep.kind === 'File') {
         asset.invalidateOnFileChange(dep.specifier);
+      } else if (dep.kind === 'Id') {
+        // Record parcelRequire calls so that the dev packager can add them as dependencies.
+        // This allows the HMR runtime to collect parents across async boundaries (through runtimes).
+        // TODO: ideally this would result as an actual dep in the graph rather than asset.meta.
+        asset.meta.hmrDeps ??= [];
+        invariant(Array.isArray(asset.meta.hmrDeps));
+        asset.meta.hmrDeps.push(dep.specifier);
       } else {
         let meta: JSONObject = {kind: dep.kind};
         if (dep.attributes) {
@@ -582,21 +880,23 @@ export default (new Transformer({
           meta.placeholder = dep.placeholder;
         }
 
+        if (dep.flags & REACT_LAZY) {
+          meta.isReactLazy = true;
+        }
+
         let env;
         if (dep.kind === 'DynamicImport') {
-          if (asset.env.isWorklet()) {
+          // https://html.spec.whatwg.org/multipage/webappapis.html#hostimportmoduledynamically(referencingscriptormodule,-modulerequest,-promisecapability)
+          if (asset.env.isWorklet() || asset.env.context === 'service-worker') {
             let loc = convertLoc(dep.loc);
             let diagnostic = {
-              message: 'import() is not allowed in worklets.',
+              message: `import() is not allowed in ${
+                asset.env.isWorklet() ? 'worklets' : 'service workers'
+              }.`,
               codeFrames: [
                 {
                   filePath: asset.filePath,
-                  codeHighlights: [
-                    {
-                      start: loc.start,
-                      end: loc.end,
-                    },
-                  ],
+                  codeHighlights: [convertSourceLocationToHighlight(loc)],
                 },
               ],
               hints: ['Try using a static `import`.'],
@@ -606,11 +906,10 @@ export default (new Transformer({
               diagnostic.codeFrames.push({
                 filePath: asset.env.loc.filePath,
                 codeHighlights: [
-                  {
-                    start: asset.env.loc.start,
-                    end: asset.env.loc.end,
-                    message: 'The environment was originally created here',
-                  },
+                  convertSourceLocationToHighlight(
+                    asset.env.loc,
+                    'The environment was originally created here',
+                  ),
                 ],
               });
             }
@@ -641,7 +940,12 @@ export default (new Transformer({
         }
 
         // Always bundle helpers, even with includeNodeModules: false, except if this is a library.
-        let isHelper = dep.is_helper && !dep.specifier.endsWith('/jsx-runtime');
+        let isHelper =
+          dep.flags & HELPER &&
+          !(
+            dep.specifier.endsWith('/jsx-runtime') ||
+            dep.specifier.endsWith('/jsx-dev-runtime')
+          );
         if (isHelper && !asset.env.isLibrary) {
           env = {
             ...env,
@@ -649,27 +953,66 @@ export default (new Transformer({
           };
         }
 
+        // Add required version range for helpers.
+        let range;
+        if (isHelper) {
+          let idx = dep.specifier.indexOf('/');
+          if (dep.specifier[0] === '@') {
+            idx = dep.specifier.indexOf('/', idx + 1);
+          }
+          let module = idx >= 0 ? dep.specifier.slice(0, idx) : dep.specifier;
+          range = pkg.dependencies[module];
+        }
+
+        if (dep.attributes?.env === 'react-server') {
+          env = {
+            ...env,
+            context: 'react-server',
+            outputFormat: 'commonjs',
+          };
+        } else if (dep.attributes?.env === 'react-client') {
+          env = {
+            ...env,
+            context: 'react-client',
+            outputFormat: 'esmodule',
+            includeNodeModules: true,
+          };
+
+          // This is a hack to prevent creating unnecessary shared bundles between actual client code
+          // and server code that runs in the client environment (e.g. react).
+          asset.isBundleSplittable = false;
+        }
+
         asset.addDependency({
           specifier: dep.specifier,
           specifierType: dep.kind === 'Require' ? 'commonjs' : 'esm',
           loc: convertLoc(dep.loc),
           priority: dep.kind === 'DynamicImport' ? 'lazy' : 'sync',
-          isOptional: dep.is_optional,
+          isOptional: Boolean(dep.flags & OPTIONAL),
           meta,
           resolveFrom: isHelper ? __filename : undefined,
+          range,
           env,
         });
       }
     }
 
-    asset.meta.id = asset.id;
     if (hoist_result) {
       asset.symbols.ensure();
-      for (let symbol in hoist_result.exported_symbols) {
-        let [local, loc] = hoist_result.exported_symbols[symbol];
-        asset.symbols.set(symbol, local, convertLoc(loc));
+      for (let {
+        exported,
+        local,
+        loc,
+        is_esm,
+      } of hoist_result.exported_symbols) {
+        asset.symbols.set(exported, local, convertLoc(loc), {isEsm: is_esm});
       }
 
+      // deps is a map of dependencies that are keyed by placeholder or specifier
+      // If a placeholder is present, that is used first since placeholders are
+      // hashed with DependencyKind's.
+      // If not, the specifier is used along with its specifierType appended to
+      // it to separate dependencies with the same specifier.
       let deps = new Map(
         asset
           .getDependencies()
@@ -679,25 +1022,28 @@ export default (new Transformer({
         dep.symbols.ensure();
       }
 
-      for (let name in hoist_result.imported_symbols) {
-        let [specifier, exported, loc] = hoist_result.imported_symbols[name];
-        let dep = deps.get(specifier);
+      for (let {
+        source,
+        local,
+        imported,
+        loc,
+      } of hoist_result.imported_symbols) {
+        let dep = deps.get(source);
         if (!dep) continue;
-        dep.symbols.set(exported, name, convertLoc(loc));
+        dep.symbols.set(imported, local, convertLoc(loc));
       }
 
-      for (let [name, specifier, exported, loc] of hoist_result.re_exports) {
-        let dep = deps.get(specifier);
+      for (let {source, local, imported, loc} of hoist_result.re_exports) {
+        let dep = deps.get(source);
         if (!dep) continue;
-
-        if (name === '*' && exported === '*') {
+        if (local === '*' && imported === '*') {
           dep.symbols.set('*', '*', convertLoc(loc), true);
         } else {
           let reExportName =
-            dep.symbols.get(exported)?.local ??
-            `$${asset.id}$re_export$${name}`;
-          asset.symbols.set(name, reExportName);
-          dep.symbols.set(exported, reExportName, convertLoc(loc), true);
+            dep.symbols.get(imported)?.local ??
+            `$${asset.id}$re_export$${local}`;
+          asset.symbols.set(local, reExportName);
+          dep.symbols.set(imported, reExportName, convertLoc(loc), true);
         }
       }
 
@@ -732,18 +1078,26 @@ export default (new Transformer({
           });
         }
 
+        // Use the asset id as a unique key if one has not already been set.
+        // This lets us create a dependency on the asset itself by using it as a specifier.
+        // Using the unique key ensures that the dependency always resolves to the correct asset,
+        // even if it came from a transformer that produced multiple assets (e.g. css modules).
+        // Also avoids needing a resolution request.
+        asset.uniqueKey ||= asset.id;
         asset.addDependency({
-          specifier: `./${path.basename(asset.filePath)}`,
+          specifier: asset.uniqueKey,
           specifierType: 'esm',
           symbols,
         });
       }
 
-      // Add * symbol if there are CJS exports, no imports/exports at all, or the asset is wrapped.
+      // Add * symbol if there are CJS exports, no imports/exports at all
+      // (and the asset has side effects), or the asset is wrapped.
       // This allows accessing symbols that don't exist without errors in symbol propagation.
       if (
         hoist_result.has_cjs_exports ||
         (!hoist_result.is_esm &&
+          asset.sideEffects &&
           deps.size === 0 &&
           Object.keys(hoist_result.exported_symbols).length === 0) ||
         (hoist_result.should_wrap && !asset.symbols.hasExportSymbol('*'))
@@ -753,18 +1107,87 @@ export default (new Transformer({
 
       asset.meta.hasCJSExports = hoist_result.has_cjs_exports;
       asset.meta.staticExports = hoist_result.static_cjs_exports;
-      asset.meta.shouldWrap = hoist_result.should_wrap;
-    } else if (needs_esm_helpers) {
-      asset.addDependency({
-        specifier: '@parcel/transformer-js/src/esmodule-helpers.js',
-        specifierType: 'esm',
-        resolveFrom: __filename,
-        env: {
-          includeNodeModules: {
-            '@parcel/transformer-js': true,
+      asset.meta.shouldWrap ||= hoist_result.should_wrap;
+    } else {
+      if (symbol_result) {
+        let deps = new Map(
+          asset
+            .getDependencies()
+            .map(dep => [dep.meta.placeholder ?? dep.specifier, dep]),
+        );
+        asset.symbols.ensure();
+
+        for (let {exported, local, loc, source} of symbol_result.exports) {
+          let dep = source ? deps.get(source) : undefined;
+          asset.symbols.set(
+            exported,
+            `${dep?.id ?? ''}$${local}`,
+            convertLoc(loc),
+          );
+          if (dep != null) {
+            dep.symbols.ensure();
+            dep.symbols.set(
+              local,
+              `${dep?.id ?? ''}$${local}`,
+              convertLoc(loc),
+              true,
+            );
+          }
+        }
+
+        for (let {source, local, imported, loc} of symbol_result.imports) {
+          let dep = deps.get(source);
+          if (!dep) continue;
+          dep.symbols.ensure();
+          dep.symbols.set(imported, local, convertLoc(loc));
+        }
+
+        for (let {source, loc} of symbol_result.exports_all) {
+          let dep = deps.get(source);
+          if (!dep) continue;
+          dep.symbols.ensure();
+          dep.symbols.set('*', '*', convertLoc(loc), true);
+        }
+
+        // Add * symbol if there are CJS exports, no imports/exports at all, or the asset is wrapped.
+        // This allows accessing symbols that don't exist without errors in symbol propagation.
+        if (
+          symbol_result.has_cjs_exports ||
+          (!symbol_result.is_esm &&
+            deps.size === 0 &&
+            symbol_result.exports.length === 0) ||
+          (symbol_result.should_wrap && !asset.symbols.hasExportSymbol('*'))
+        ) {
+          asset.symbols.ensure();
+          asset.symbols.set('*', `$${asset.id}$exports`);
+        }
+      } else {
+        // If the asset is wrapped, add * as a fallback
+        asset.symbols.ensure();
+        asset.symbols.set('*', `$${asset.id}$exports`);
+      }
+
+      // For all other imports and requires, mark everything as imported (this covers both dynamic
+      // imports and non-top-level requires.)
+      for (let dep of asset.getDependencies()) {
+        if (dep.symbols.isCleared) {
+          dep.symbols.ensure();
+          dep.symbols.set('*', `${dep.id}$`);
+        }
+      }
+
+      if (needs_esm_helpers) {
+        asset.addDependency({
+          specifier: '@parcel/transformer-js/src/esmodule-helpers.js',
+          specifierType: 'esm',
+          resolveFrom: __filename,
+          env: {
+            includeNodeModules: {
+              '@parcel/transformer-js': true,
+            },
           },
-        },
-      });
+        });
+      }
     }
 
     asset.type = 'js';
@@ -779,6 +1202,6 @@ export default (new Transformer({
       asset.setMap(sourceMap);
     }
 
-    return [asset];
+    return [asset, ...macroAssets];
   },
 }): Transformer);

@@ -8,7 +8,7 @@ import assert from 'assert';
 import path from 'path';
 import Parcel, {createWorkerFarm} from '../src/Parcel';
 
-describe('Parcel', function() {
+describe('Parcel', function () {
   this.timeout(75000);
 
   let workerFarm;
@@ -71,6 +71,59 @@ describe('Parcel', function() {
       assert.equal(workerFarm.sharedReferences.size, 0);
       assert.equal(workerFarm.sharedReferencesByValue.size, 0);
       await workerFarm.end();
+    });
+  });
+});
+
+describe('ParcelAPI', function () {
+  this.timeout(75000);
+
+  let workerFarm;
+  beforeEach(() => {
+    workerFarm = createWorkerFarm();
+  });
+
+  afterEach(() => workerFarm.end());
+
+  describe('parcel.unstable_transform()', () => {
+    it('should transform simple file', async () => {
+      let parcel = createParcel({workerFarm});
+      let res = await parcel.unstable_transform({
+        filePath: path.join(__dirname, 'fixtures/parcel/index.js'),
+      });
+      let code = await res[0].getCode();
+      assert(code.includes(`exports.default = 'test'`));
+    });
+
+    it('should transform with standalone mode', async () => {
+      let parcel = createParcel({workerFarm});
+      let res = await parcel.unstable_transform({
+        filePath: path.join(__dirname, 'fixtures/parcel/other.js'),
+        query: 'standalone=true',
+      });
+      let code = await res[0].getCode();
+
+      assert(code.includes(`require("./index.js")`));
+      assert(code.includes(`new URL("index.js", "file:" + __filename);`));
+      assert(code.includes(`import('index.js')`));
+    });
+  });
+
+  describe('parcel.resolve()', () => {
+    it('should resolve dependencies', async () => {
+      let parcel = createParcel({workerFarm});
+      let res = await parcel.unstable_resolve({
+        specifier: './other',
+        specifierType: 'esm',
+        resolveFrom: path.join(__dirname, 'fixtures/parcel/index.js'),
+      });
+
+      assert.deepEqual(res, {
+        filePath: path.join(__dirname, 'fixtures/parcel/other.js'),
+        code: undefined,
+        query: undefined,
+        sideEffects: true,
+      });
     });
   });
 });

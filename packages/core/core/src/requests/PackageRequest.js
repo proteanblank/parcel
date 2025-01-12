@@ -1,11 +1,14 @@
 // @flow strict-local
 
+import type {ContentKey} from '@parcel/graph';
 import type {Async} from '@parcel/types';
 import type {SharedReference} from '@parcel/workers';
+
 import type {StaticRunOpts} from '../RequestTracker';
-import type {Bundle, ContentKey} from '../types';
+import {requestTypes} from '../RequestTracker';
+import type {Bundle} from '../types';
 import type BundleGraph from '../BundleGraph';
-import type {BundleInfo} from '../PackagerRunner';
+import type {BundleInfo, RunPackagerRunnerResult} from '../PackagerRunner';
 import type {ConfigAndCachePath} from './ParcelConfigRequest';
 
 import nullthrows from 'nullthrows';
@@ -18,17 +21,20 @@ type PackageRequestInput = {|
   bundle: Bundle,
   bundleGraphReference: SharedReference,
   optionsRef: SharedReference,
+  useMainThread?: boolean,
 |};
 
-type RunInput = {|
+export type PackageRequestResult = BundleInfo[];
+
+type RunInput<TResult> = {|
   input: PackageRequestInput,
-  ...StaticRunOpts,
+  ...StaticRunOpts<TResult>,
 |};
 
 export type PackageRequest = {|
   id: ContentKey,
-  +type: 'package_request',
-  run: RunInput => Async<BundleInfo>,
+  +type: typeof requestTypes.package_request,
+  run: (RunInput<BundleInfo[]>) => Async<BundleInfo[]>,
   input: PackageRequestInput,
 |};
 
@@ -36,36 +42,33 @@ export function createPackageRequest(
   input: PackageRequestInput,
 ): PackageRequest {
   return {
-    type: 'package_request',
+    type: requestTypes.package_request,
     id: input.bundleGraph.getHash(input.bundle),
     run,
     input,
   };
 }
 
-async function run({input, api, farm}: RunInput) {
-  let {bundleGraphReference, optionsRef, bundle} = input;
-  let runPackage = farm.createHandle('runPackage');
+async function run({input, api, farm}) {
+  let {bundleGraphReference, optionsRef, bundle, useMainThread} = input;
+  let runPackage = farm.createHandle('runPackage', useMainThread);
 
   let start = Date.now();
   let {devDeps, invalidDevDeps} = await getDevDepRequests(api);
   let {cachePath} = nullthrows(
     await api.runRequest<null, ConfigAndCachePath>(createParcelConfigRequest()),
   );
-  let {
-    devDepRequests,
-    configRequests,
-    bundleInfo,
-    invalidations,
-  } = await runPackage({
-    bundle,
-    bundleGraphReference,
-    optionsRef,
-    configCachePath: cachePath,
-    previousDevDeps: devDeps,
-    invalidDevDeps,
-    previousInvalidations: api.getInvalidations(),
-  });
+
+  let {devDepRequests, configRequests, bundleInfo, invalidations} =
+    (await runPackage({
+      bundle,
+      bundleGraphReference,
+      optionsRef,
+      configCachePath: cachePath,
+      previousDevDeps: devDeps,
+      invalidDevDeps,
+      previousInvalidations: api.getInvalidations(),
+    }): RunPackagerRunnerResult);
 
   for (let devDepRequest of devDepRequests) {
     await runDevDepRequest(api, devDepRequest);
@@ -92,7 +95,10 @@ async function run({input, api, farm}: RunInput) {
     }
   }
 
-  bundleInfo.time = Date.now() - start;
+  for (let info of bundleInfo) {
+    // $FlowFixMe[cannot-write] time is marked read-only, but this is the exception
+    info.time = Date.now() - start;
+  }
 
   api.storeResult(bundleInfo);
   return bundleInfo;

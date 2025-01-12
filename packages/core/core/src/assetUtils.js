@@ -11,7 +11,6 @@ import type {
   Symbol,
   SourceLocation,
   Transformer,
-  QueryParameters,
 } from '@parcel/types';
 import type {
   Asset,
@@ -20,7 +19,6 @@ import type {
   Environment,
   ParcelOptions,
 } from './types';
-import {objectSortedEntries} from '@parcel/utils';
 
 import {Readable} from 'stream';
 import {PluginLogger} from '@parcel/logger';
@@ -38,16 +36,16 @@ import {
   fromProjectPath,
   fromProjectPathRelative,
 } from './projectPath';
-import {hashString} from '@parcel/hash';
+import {hashString} from '@parcel/rust';
 import {BundleBehavior as BundleBehaviorMap} from './types';
+import {PluginTracer} from '@parcel/profiler';
 
 type AssetOptions = {|
   id?: string,
   committed?: boolean,
-  hash?: ?string,
   idBase?: ?string,
   filePath: ProjectPath,
-  query?: ?QueryParameters,
+  query?: ?string,
   type: string,
   contentKey?: ?string,
   mapKey?: ?string,
@@ -76,9 +74,6 @@ export function createAssetIdFromOptions(options: AssetOptions): string {
     options.idBase != null
       ? options.idBase
       : fromProjectPathRelative(options.filePath);
-  let queryString = options.query
-    ? JSON.stringify(objectSortedEntries(options.query))
-    : '';
 
   return hashString(
     idBase +
@@ -88,7 +83,7 @@ export function createAssetIdFromOptions(options: AssetOptions): string {
       ':' +
       (options.pipeline ?? '') +
       ':' +
-      queryString,
+      (options.query ?? ''),
   );
 }
 
@@ -99,7 +94,6 @@ export function createAsset(
   return {
     id: options.id != null ? options.id : createAssetIdFromOptions(options),
     committed: options.committed ?? false,
-    hash: options.hash,
     filePath: options.filePath,
     query: options.query,
     bundleBehavior: options.bundleBehavior
@@ -131,7 +125,7 @@ export function createAsset(
         ]),
       ),
     sideEffects: options.sideEffects ?? true,
-    uniqueKey: options.uniqueKey ?? '',
+    uniqueKey: options.uniqueKey,
     plugin: options.plugin,
     configPath: options.configPath,
     configKeyPath: options.configKeyPath,
@@ -158,14 +152,16 @@ async function _generateFromAST(asset: CommittedAsset | UncommittedAsset) {
   }
 
   let pluginName = nullthrows(asset.value.plugin);
-  let {plugin} = await loadPlugin<Transformer<mixed>>(
-    pluginName,
-    fromProjectPath(
-      asset.options.projectRoot,
-      nullthrows(asset.value.configPath),
+  let {plugin} = nullthrows(
+    await loadPlugin<Transformer<mixed>>(
+      pluginName,
+      fromProjectPath(
+        asset.options.projectRoot,
+        nullthrows(asset.value.configPath),
+      ),
+      nullthrows(asset.value.configKeyPath),
+      asset.options,
     ),
-    nullthrows(asset.value.configKeyPath),
-    asset.options,
   );
   let generate = plugin.generate?.bind(plugin);
   if (!generate) {
@@ -177,6 +173,7 @@ async function _generateFromAST(asset: CommittedAsset | UncommittedAsset) {
     ast,
     options: new PluginOptions(asset.options),
     logger: new PluginLogger({origin: pluginName}),
+    tracer: new PluginTracer({origin: pluginName, category: 'asset-generate'}),
   });
 
   let mapBuffer = map?.toBuffer();

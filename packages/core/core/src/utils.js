@@ -1,6 +1,5 @@
 // @flow strict-local
 
-import type {AbortSignal} from 'abortcontroller-polyfill/dist/cjs-ponyfill';
 import type {
   FilePath,
   FileCreateInvalidation,
@@ -11,28 +10,22 @@ import type {
   ParcelOptions,
   InternalFileCreateInvalidation,
   InternalSourceLocation,
+  InternalDevDepOptions,
+  Invalidations,
 } from './types';
+import type {PackageManager} from '@parcel/package-manager';
 
 import invariant from 'assert';
 import baseX from 'base-x';
 import {hashObject} from '@parcel/utils';
-import {registerSerializableClass} from './serializer';
-import AssetGraph from './AssetGraph';
-import BundleGraph from './BundleGraph';
-import Graph from './Graph';
-import ParcelConfig from './ParcelConfig';
-import {RequestGraph} from './RequestTracker';
-import Config from './public/Config';
 import {fromProjectPath, toProjectPath} from './projectPath';
-// flowlint-next-line untyped-import:off
-import packageJson from '../package.json';
 
 const base62 = baseX(
   '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ',
 );
 
 export function getBundleGroupId(bundleGroup: BundleGroup): string {
-  return 'bundle_group:' + bundleGroup.entryAssetId;
+  return 'bundle_group:' + bundleGroup.target.name + bundleGroup.entryAssetId;
 }
 
 export function assertSignalNotAborted(signal: ?AbortSignal): void {
@@ -43,32 +36,6 @@ export function assertSignalNotAborted(signal: ?AbortSignal): void {
 
 export class BuildAbortError extends Error {
   name: string = 'BuildAbortError';
-}
-
-let coreRegistered;
-export function registerCoreWithSerializer() {
-  if (coreRegistered) {
-    return;
-  }
-
-  const packageVersion: mixed = packageJson.version;
-  if (typeof packageVersion !== 'string') {
-    throw new Error('Expected package version to be a string');
-  }
-
-  // $FlowFixMe[incompatible-cast]
-  for (let [name, ctor] of (Object.entries({
-    AssetGraph,
-    Config,
-    BundleGraph,
-    Graph,
-    ParcelConfig,
-    RequestGraph,
-  }): Array<[string, Class<*>]>)) {
-    registerSerializableClass(packageVersion + ':' + name, ctor);
-  }
-
-  coreRegistered = true;
 }
 
 export function getPublicId(
@@ -99,6 +66,7 @@ const ignoreOptions = new Set([
   'shouldAutoInstall',
   'logLevel',
   'shouldProfile',
+  'shouldTrace',
   'shouldPatchConsole',
   'projectRoot',
   'additionalReporters',
@@ -107,13 +75,51 @@ const ignoreOptions = new Set([
 export function optionsProxy(
   options: ParcelOptions,
   invalidateOnOptionChange: string => void,
+  addDevDependency?: (devDep: InternalDevDepOptions) => void,
 ): ParcelOptions {
+  let packageManager = addDevDependency
+    ? proxyPackageManager(
+        options.projectRoot,
+        options.packageManager,
+        addDevDependency,
+      )
+    : options.packageManager;
   return new Proxy(options, {
     get(target, prop) {
+      if (prop === 'packageManager') {
+        return packageManager;
+      }
+
       if (!ignoreOptions.has(prop)) {
         invalidateOnOptionChange(prop);
       }
 
+      return target[prop];
+    },
+  });
+}
+
+function proxyPackageManager(
+  projectRoot: FilePath,
+  packageManager: PackageManager,
+  addDevDependency: (devDep: InternalDevDepOptions) => void,
+): PackageManager {
+  let require = (id: string, from: string, opts) => {
+    addDevDependency({
+      specifier: id,
+      resolveFrom: toProjectPath(projectRoot, from),
+      range: opts?.range,
+    });
+    return packageManager.require(id, from, opts);
+  };
+
+  return new Proxy(packageManager, {
+    get(target, prop) {
+      if (prop === 'require') {
+        return require;
+      }
+
+      // $FlowFixMe
       return target[prop];
     },
   });
@@ -146,6 +152,17 @@ export function invalidateOnFileCreateToInternal(
       aboveFilePath: toProjectPath(projectRoot, invalidation.aboveFilePath),
     };
   }
+}
+
+export function createInvalidations(): Invalidations {
+  return {
+    invalidateOnBuild: false,
+    invalidateOnStartup: false,
+    invalidateOnOptionChange: new Set(),
+    invalidateOnEnvChange: new Set(),
+    invalidateOnFileChange: new Set(),
+    invalidateOnFileCreate: [],
+  };
 }
 
 export function fromInternalSourceLocation(

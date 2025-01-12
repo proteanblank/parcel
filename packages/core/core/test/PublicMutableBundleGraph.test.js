@@ -28,6 +28,7 @@ describe('PublicMutableBundleGraph', () => {
   it('creates publicIds for bundles', () => {
     let internalBundleGraph = InternalBundleGraph.fromAssetGraph(
       createMockAssetGraph(),
+      false,
     );
     let mutableBundleGraph = new MutableBundleGraph(
       internalBundleGraph,
@@ -63,6 +64,7 @@ describe('PublicMutableBundleGraph', () => {
   it('is safe to add a bundle to a bundleGroup multiple times', () => {
     let internalBundleGraph = InternalBundleGraph.fromAssetGraph(
       createMockAssetGraph(),
+      false,
     );
     let mutableBundleGraph = new MutableBundleGraph(
       internalBundleGraph,
@@ -151,7 +153,7 @@ function createMockAssetGraph() {
   });
 
   let filePath = toProjectPath('/', '/index.js');
-  let req1 = {filePath, env: DEFAULT_ENV, query: {}};
+  let req1 = {filePath, env: DEFAULT_ENV};
   graph.resolveDependency(dep1, nodeFromAssetGroup(req1).value, '5');
   graph.resolveAssetGroup(
     req1,
@@ -161,7 +163,6 @@ function createMockAssetGraph() {
         filePath,
         type: 'js',
         isSource: true,
-        hash: '#1',
         stats,
         env: DEFAULT_ENV,
       }),
@@ -170,7 +171,7 @@ function createMockAssetGraph() {
   );
 
   filePath = toProjectPath('/', '/index2.js');
-  let req2 = {filePath, env: DEFAULT_ENV, query: {}};
+  let req2 = {filePath, env: DEFAULT_ENV};
   graph.resolveDependency(dep2, nodeFromAssetGroup(req2).value, '7');
   graph.resolveAssetGroup(
     req2,
@@ -180,7 +181,6 @@ function createMockAssetGraph() {
         filePath,
         type: 'js',
         isSource: true,
-        hash: '#2',
         stats,
         env: DEFAULT_ENV,
       }),

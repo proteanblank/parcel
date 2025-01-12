@@ -2,27 +2,31 @@
 
 import type {GraphVisitor} from '@parcel/types';
 import type {
+  ContentGraphOpts,
+  ContentKey,
+  NodeId,
+  SerializedContentGraph,
+} from '@parcel/graph';
+import type {
   Asset,
   AssetGraphNode,
   AssetGroup,
   AssetGroupNode,
   AssetNode,
-  ContentKey,
   Dependency,
   DependencyNode,
   Entry,
   EntryFileNode,
   EntrySpecifierNode,
   Environment,
-  NodeId,
   Target,
 } from './types';
 
 import invariant from 'assert';
-import {hashString, Hash} from '@parcel/hash';
-import {hashObject, objectSortedEntries} from '@parcel/utils';
+import {hashString, Hash} from '@parcel/rust';
+import {hashObject} from '@parcel/utils';
 import nullthrows from 'nullthrows';
-import ContentGraph, {type SerializedContentGraph} from './ContentGraph';
+import {ContentGraph} from '@parcel/graph';
 import {createDependency} from './Dependency';
 import {type ProjectPath, fromProjectPathRelative} from './projectPath';
 
@@ -30,6 +34,11 @@ type InitOpts = {|
   entries?: Array<ProjectPath>,
   targets?: Array<Target>,
   assetGroups?: Array<AssetGroup>,
+|};
+
+type AssetGraphOpts = {|
+  ...ContentGraphOpts<AssetGraphNode>,
+  hash?: ?string,
 |};
 
 type SerializedAssetGraph = {|
@@ -45,7 +54,7 @@ export function nodeFromDep(dep: Dependency): DependencyNode {
     deferred: false,
     excluded: false,
     usedSymbolsDown: new Set(),
-    usedSymbolsUp: new Set(),
+    usedSymbolsUp: new Map(),
     usedSymbolsDownDirty: true,
     usedSymbolsUpDirtyDown: true,
     usedSymbolsUpDirtyUp: true,
@@ -63,9 +72,7 @@ export function nodeFromAssetGroup(assetGroup: AssetGroup): AssetGroupNode {
         ':' +
         (assetGroup.pipeline ?? '') +
         ':' +
-        (assetGroup.query
-          ? JSON.stringify(objectSortedEntries(assetGroup.query))
-          : ''),
+        (assetGroup.query ?? ''),
     ),
     type: 'asset_group',
     value: assetGroup,
@@ -104,8 +111,10 @@ export default class AssetGraph extends ContentGraph<AssetGraphNode> {
   onNodeRemoved: ?(nodeId: NodeId) => mixed;
   hash: ?string;
   envCache: Map<string, Environment>;
+  safeToIncrementallyBundle: boolean = true;
+  undeferredDependencies: Set<Dependency>;
 
-  constructor(opts: ?SerializedAssetGraph) {
+  constructor(opts: ?AssetGraphOpts) {
     if (opts) {
       let {hash, ...rest} = opts;
       super(rest);
@@ -120,11 +129,13 @@ export default class AssetGraph extends ContentGraph<AssetGraphNode> {
         }),
       );
     }
+
+    this.undeferredDependencies = new Set();
     this.envCache = new Map();
   }
 
   // $FlowFixMe[prop-missing]
-  static deserialize(opts: SerializedAssetGraph): AssetGraph {
+  static deserialize(opts: AssetGraphOpts): AssetGraph {
     return new AssetGraph(opts);
   }
 
@@ -185,19 +196,6 @@ export default class AssetGraph extends ContentGraph<AssetGraphNode> {
   removeNode(nodeId: NodeId): void {
     this.hash = null;
     this.onNodeRemoved && this.onNodeRemoved(nodeId);
-    // This needs to mark all connected nodes that doesn't become orphaned
-    // due to replaceNodesConnectedTo to make sure that the symbols of
-    // nodes from which at least one parent was removed are updated.
-    let node = nullthrows(this.getNode(nodeId));
-    if (this.isOrphanedNode(nodeId) && node.type === 'dependency') {
-      let children = this.getNodeIdsConnectedFrom(nodeId).map(id =>
-        nullthrows(this.getNode(id)),
-      );
-      for (let n of children) {
-        invariant(n.type === 'asset_group' || n.type === 'asset');
-        n.usedSymbolsDownDirty = true;
-      }
-    }
     return super.removeNode(nodeId);
   }
 
@@ -244,6 +242,7 @@ export default class AssetGraph extends ContentGraph<AssetGraphNode> {
       if (node.value.env.isLibrary) {
         // in library mode, all of the entry's symbols are "used"
         node.usedSymbolsDown.add('*');
+        node.usedSymbolsUp.set('*', undefined);
       }
       return node;
     });
@@ -299,17 +298,21 @@ export default class AssetGraph extends ContentGraph<AssetGraphNode> {
     ) {
       return true;
     }
+    // Node types are proved above
+    let dependencyNode = node;
+    let assetGroupNode = childNode;
 
-    let {sideEffects, canDefer = true} = childNode.value;
-    let dependency = node.value;
-    let previouslyDeferred = childNode.deferred;
+    let {sideEffects, canDefer = true} = assetGroupNode.value;
+    let dependency = dependencyNode.value;
+    let dependencyPreviouslyDeferred = dependencyNode.hasDeferred;
+    let assetGroupPreviouslyDeferred = assetGroupNode.deferred;
     let defer = this.shouldDeferDependency(dependency, sideEffects, canDefer);
-    node.hasDeferred = defer;
-    childNode.deferred = defer;
+    dependencyNode.hasDeferred = defer;
+    assetGroupNode.deferred = defer;
 
-    if (!previouslyDeferred && defer) {
+    if (!dependencyPreviouslyDeferred && defer) {
       this.markParentsWithHasDeferred(nodeId);
-    } else if (previouslyDeferred && !defer) {
+    } else if (assetGroupPreviouslyDeferred && !defer) {
       this.unmarkParentsWithHasDeferred(childNodeId);
     }
 
@@ -353,10 +356,12 @@ export default class AssetGraph extends ContentGraph<AssetGraphNode> {
         nodeId !== traversedNodeId
       ) {
         if (!ctx?.hasDeferred) {
+          this.safeToIncrementallyBundle = false;
           delete traversedNode.hasDeferred;
         }
         actions.skipChildren();
       } else if (traversedNode.type === 'dependency') {
+        this.safeToIncrementallyBundle = false;
         traversedNode.hasDeferred = false;
       } else if (nodeId !== traversedNodeId) {
         actions.skipChildren();
@@ -374,41 +379,66 @@ export default class AssetGraph extends ContentGraph<AssetGraphNode> {
     sideEffects: ?boolean,
     canDefer: boolean,
   ): boolean {
-    let defer = false;
     let dependencySymbols = dependency.symbols;
-    if (
-      dependencySymbols &&
+
+    // Doing this separately keeps Flow happy further down
+    if (!dependencySymbols) {
+      return false;
+    }
+
+    let isDeferrable =
       [...dependencySymbols].every(([, {isWeak}]) => isWeak) &&
       sideEffects === false &&
       canDefer &&
-      !dependencySymbols.has('*')
-    ) {
-      let depNodeId = this.getNodeIdByContentKey(dependency.id);
-      let depNode = this.getNode(depNodeId);
-      invariant(depNode);
+      !dependencySymbols.has('*');
 
-      let assets = this.getNodeIdsConnectedTo(depNodeId);
-      let symbols = new Map(
-        [...dependencySymbols].map(([key, val]) => [val.local, key]),
-      );
-      invariant(assets.length === 1);
-      let firstAsset = nullthrows(this.getNode(assets[0]));
-      invariant(firstAsset.type === 'asset');
-      let resolvedAsset = firstAsset.value;
-      let deps = this.getIncomingDependencies(resolvedAsset);
-      defer = deps.every(
-        d =>
-          d.symbols &&
-          !(d.env.isLibrary && d.isEntry) &&
-          !d.symbols.has('*') &&
-          ![...d.symbols.keys()].some(symbol => {
-            if (!resolvedAsset.symbols) return true;
-            let assetSymbol = resolvedAsset.symbols?.get(symbol)?.local;
-            return assetSymbol != null && symbols.has(assetSymbol);
-          }),
-      );
+    if (!isDeferrable) {
+      return false;
     }
-    return defer;
+
+    let depNodeId = this.getNodeIdByContentKey(dependency.id);
+    let depNode = this.getNode(depNodeId);
+    invariant(depNode);
+
+    let assets = this.getNodeIdsConnectedTo(depNodeId);
+    let symbols = new Map(
+      [...dependencySymbols].map(([key, val]) => [val.local, key]),
+    );
+    invariant(assets.length === 1);
+    let firstAsset = nullthrows(this.getNode(assets[0]));
+    invariant(firstAsset.type === 'asset');
+    let resolvedAsset = firstAsset.value;
+
+    // This doesn't change from here, so checking it now saves
+    // us some calls to `getIncomingDependency`
+    if (!resolvedAsset.symbols) {
+      return true;
+    }
+
+    let deps = this.getIncomingDependencies(resolvedAsset);
+
+    return deps.every(d => {
+      // If this dependency has already been through this process, and we
+      // know it's not deferrable, then there's no need to re-check
+      if (this.undeferredDependencies.has(d)) {
+        return false;
+      }
+
+      let depIsDeferrable =
+        d.symbols &&
+        !(d.env.isLibrary && d.isEntry) &&
+        !d.symbols.has('*') &&
+        ![...d.symbols.keys()].some(symbol => {
+          let assetSymbol = resolvedAsset.symbols?.get(symbol)?.local;
+          return assetSymbol != null && symbols.has(assetSymbol);
+        });
+
+      if (!depIsDeferrable) {
+        // Mark this dep as not deferrable so it doesn't have to be re-checked
+        this.undeferredDependencies.add(d);
+        return false;
+      }
+    });
   }
 
   resolveAssetGroup(
@@ -455,6 +485,10 @@ export default class AssetGraph extends ContentGraph<AssetGraphNode> {
         let dependentAsset = assetsByKey.get(dep.specifier);
         if (dependentAsset) {
           dependentAssets.push(dependentAsset);
+          if (dependentAsset.id === asset.id) {
+            // Don't orphan circular dependencies.
+            isDirect = true;
+          }
         }
       }
       let id = this.addNode(nodeFromAsset(asset));
@@ -496,6 +530,14 @@ export default class AssetGraph extends ContentGraph<AssetGraphNode> {
           ...depNode.value.meta,
           ...existing.value.resolverMeta,
         };
+        depNode.value.resolverMeta = existing.value.resolverMeta;
+      }
+      if (
+        existing?.type === 'dependency' &&
+        existing.value.resolverPriority != null
+      ) {
+        depNode.value.priority = existing.value.resolverPriority;
+        depNode.value.resolverPriority = existing.value.resolverPriority;
       }
       let dependentAsset = dependentAssets.find(
         a => a.uniqueKey === dep.specifier,
@@ -508,6 +550,7 @@ export default class AssetGraph extends ContentGraph<AssetGraphNode> {
       depNodeIds.push(this.addNode(depNode));
     }
 
+    assetNode.usedSymbolsUpDirty = true;
     assetNode.usedSymbolsDownDirty = true;
     this.replaceNodeIdsConnectedTo(
       this.getNodeIdByContentKey(assetNode.id),
@@ -524,11 +567,7 @@ export default class AssetGraph extends ContentGraph<AssetGraphNode> {
   }
 
   getIncomingDependencies(asset: Asset): Array<Dependency> {
-    let nodeId = this._contentKeyToNodeId.get(asset.id);
-    if (!nodeId) {
-      return [];
-    }
-
+    let nodeId = this.getNodeIdByContentKey(asset.id);
     let assetGroupIds = this.getNodeIdsConnectedTo(nodeId);
     let dependencies = [];
     for (let i = 0; i < assetGroupIds.length; i++) {

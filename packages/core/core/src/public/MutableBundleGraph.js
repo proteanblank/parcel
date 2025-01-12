@@ -9,13 +9,17 @@ import type {
   MutableBundleGraph as IMutableBundleGraph,
   Target,
 } from '@parcel/types';
-import type {ParcelOptions, BundleGroup as InternalBundleGroup} from '../types';
+import type {
+  ParcelOptions,
+  BundleGroup as InternalBundleGroup,
+  BundleNode,
+} from '../types';
 
 import invariant from 'assert';
 import nullthrows from 'nullthrows';
-import {hashString} from '@parcel/hash';
+import {hashString} from '@parcel/rust';
 import BundleGraph from './BundleGraph';
-import InternalBundleGraph from '../BundleGraph';
+import InternalBundleGraph, {bundleGraphEdgeTypes} from '../BundleGraph';
 import {Bundle, bundleToInternalBundle} from './Bundle';
 import {assetFromValue, assetToAssetValue} from './Asset';
 import {getBundleGroupId, getPublicId} from '../utils';
@@ -27,16 +31,25 @@ import {fromProjectPathRelative} from '../projectPath';
 import {BundleBehavior} from '../types';
 import BundleGroup, {bundleGroupToInternalBundleGroup} from './BundleGroup';
 
-export default class MutableBundleGraph extends BundleGraph<IBundle>
-  implements IMutableBundleGraph {
+export default class MutableBundleGraph
+  extends BundleGraph<IBundle>
+  implements IMutableBundleGraph
+{
   #graph /*: InternalBundleGraph */;
   #options /*: ParcelOptions */;
   #bundlePublicIds /*: Set<string> */ = new Set<string>();
 
   constructor(graph: InternalBundleGraph, options: ParcelOptions) {
-    super(graph, Bundle.get, options);
+    super(graph, Bundle.get.bind(Bundle), options);
     this.#graph = graph;
     this.#options = options;
+  }
+
+  addAssetToBundle(asset: IAsset, bundle: IBundle) {
+    this.#graph.addAssetToBundle(
+      assetToAssetValue(asset),
+      bundleToInternalBundle(bundle),
+    );
   }
 
   addAssetGraphToBundle(
@@ -102,24 +115,37 @@ export default class MutableBundleGraph extends BundleGraph<IBundle>
       dependencyNode.id,
     );
     let resolvedNodeId = this.#graph._graph.getNodeIdByContentKey(resolved.id);
-    let assetNodes = this.#graph._graph.getNodeIdsConnectedFrom(
-      dependencyNodeId,
-    );
+    let assetNodes =
+      this.#graph._graph.getNodeIdsConnectedFrom(dependencyNodeId);
     this.#graph._graph.addEdge(dependencyNodeId, bundleGroupNodeId);
     this.#graph._graph.replaceNodeIdsConnectedTo(bundleGroupNodeId, assetNodes);
-    this.#graph._graph.addEdge(dependencyNodeId, resolvedNodeId, 'references');
-    this.#graph._graph.removeEdge(dependencyNodeId, resolvedNodeId);
+    this.#graph._graph.addEdge(
+      dependencyNodeId,
+      resolvedNodeId,
+      bundleGraphEdgeTypes.references,
+    );
+    if (
+      // This check is needed for multiple targets, when we go over the same nodes twice
+      this.#graph._graph.hasEdge(
+        dependencyNodeId,
+        resolvedNodeId,
+        bundleGraphEdgeTypes.null,
+      )
+    ) {
+      //nullEdgeType
+      this.#graph._graph.removeEdge(dependencyNodeId, resolvedNodeId);
+    }
 
     if (dependency.isEntry) {
       this.#graph._graph.addEdge(
         nullthrows(this.#graph._graph.rootNodeId),
         bundleGroupNodeId,
-        'bundle',
+        bundleGraphEdgeTypes.bundle,
       );
     } else {
       let inboundBundleNodeIds = this.#graph._graph.getNodeIdsConnectedTo(
         dependencyNodeId,
-        'contains',
+        bundleGraphEdgeTypes.contains,
       );
       for (let inboundBundleNodeId of inboundBundleNodeIds) {
         invariant(
@@ -128,7 +154,7 @@ export default class MutableBundleGraph extends BundleGraph<IBundle>
         this.#graph._graph.addEdge(
           inboundBundleNodeId,
           bundleGroupNodeId,
-          'bundle',
+          bundleGraphEdgeTypes.bundle,
         );
       }
     }
@@ -182,12 +208,14 @@ export default class MutableBundleGraph extends BundleGraph<IBundle>
       isPlaceholder = entryAssetNode.requested === false;
     }
 
-    let bundleNode = {
+    let bundleNode: BundleNode = {
       type: 'bundle',
       id: bundleId,
       value: {
         id: bundleId,
-        hashReference: HASH_REF_PREFIX + bundleId,
+        hashReference: this.#options.shouldContentHash
+          ? HASH_REF_PREFIX + bundleId
+          : bundleId.slice(-8),
         type: opts.entryAsset ? opts.entryAsset.type : opts.type,
         env: opts.env
           ? environmentToInternalEnvironment(opts.env)
@@ -208,6 +236,7 @@ export default class MutableBundleGraph extends BundleGraph<IBundle>
         name: null,
         displayName: null,
         publicId,
+        manualSharedBundle: opts.manualSharedBundle,
       },
     };
 

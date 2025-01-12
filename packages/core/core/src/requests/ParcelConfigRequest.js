@@ -27,6 +27,7 @@ import ThrowableDiagnostic, {
   generateJSONCodeHighlights,
   escapeMarkdown,
   md,
+  errorToDiagnostic,
 } from '@parcel/diagnostic';
 import {parse} from 'json5';
 import path from 'path';
@@ -37,6 +38,7 @@ import {optionsProxy} from '../utils';
 import ParcelConfig from '../ParcelConfig';
 import {createBuildCache} from '../buildCache';
 import {toProjectPath} from '../projectPath';
+import {requestTypes} from '../RequestTracker';
 
 type ConfigMap<K, V> = {[K]: V, ...};
 
@@ -45,17 +47,19 @@ export type ConfigAndCachePath = {|
   cachePath: string,
 |};
 
-type RunOpts = {|
+type RunOpts<TResult> = {|
   input: null,
-  ...StaticRunOpts,
+  ...StaticRunOpts<TResult>,
 |};
 
 export type ParcelConfigRequest = {|
   id: string,
-  type: string,
+  type: typeof requestTypes.parcel_config_request,
   input: null,
-  run: RunOpts => Async<ConfigAndCachePath>,
+  run: (RunOpts<ParcelConfigRequestResult>) => Async<ParcelConfigRequestResult>,
 |};
+
+export type ParcelConfigRequestResult = ConfigAndCachePath;
 
 type ParcelConfigChain = {|
   config: ProcessedParcelConfig,
@@ -67,8 +71,8 @@ const type = 'parcel_config_request';
 export default function createParcelConfigRequest(): ParcelConfigRequest {
   return {
     id: type,
-    type,
-    async run({api, options}: RunOpts): Promise<ConfigAndCachePath> {
+    type: requestTypes[type],
+    async run({api, options}) {
       let {
         config,
         extendedFiles,
@@ -264,6 +268,16 @@ function processPipeline(
   }
 }
 
+const RESERVED_PIPELINES = new Set([
+  'node:',
+  'npm:',
+  'http:',
+  'https:',
+  'data:',
+  'tel:',
+  'mailto:',
+]);
+
 async function processMap(
   // $FlowFixMe
   map: ?ConfigMap<any, any>,
@@ -277,12 +291,12 @@ async function processMap(
   // $FlowFixMe
   let res: ConfigMap<any, any> = {};
   for (let k in map) {
-    if (k.startsWith('node:')) {
+    let i = k.indexOf(':');
+    if (i > 0 && RESERVED_PIPELINES.has(k.slice(0, i + 1))) {
       let code = await options.inputFS.readFile(filePath, 'utf8');
       throw new ThrowableDiagnostic({
         diagnostic: {
-          message:
-            'Named pipeline `node:` is reserved for builtin Node.js libraries',
+          message: `Named pipeline '${k.slice(0, i + 1)}' is reserved.`,
           origin: '@parcel/core',
           codeFrames: [
             {
@@ -297,6 +311,8 @@ async function processMap(
               ]),
             },
           ],
+          documentationURL:
+            'https://parceljs.org/features/dependency-resolution/#url-schemes',
         },
       });
     }
@@ -328,7 +344,9 @@ export async function processConfig(
             configFile.resolveFrom,
           ),
         }
-      : {...null}),
+      : {
+          /*::...null*/
+        }),
     resolvers: processPipeline(
       options,
       configFile.resolvers,
@@ -373,6 +391,12 @@ export async function processConfig(
     optimizers: await processMap(
       configFile.optimizers,
       '/optimizers',
+      configFile.filePath,
+      options,
+    ),
+    compressors: await processMap(
+      configFile.compressors,
+      '/compressors',
       configFile.filePath,
       options,
     ),
@@ -425,16 +449,8 @@ export async function processConfigChain(
             : '/extends';
           let resolved = await resolveExtends(ext, filePath, key, options);
           extendedFiles.push(resolved);
-          let {
-            extendedFiles: moreExtendedFiles,
-            config: nextConfig,
-          } = await processExtendedConfig(
-            filePath,
-            key,
-            ext,
-            resolved,
-            options,
-          );
+          let {extendedFiles: moreExtendedFiles, config: nextConfig} =
+            await processExtendedConfig(filePath, key, ext, resolved, options);
           extendedFiles = extendedFiles.concat(moreExtendedFiles);
           extStartConfig = extStartConfig
             ? mergeConfigs(extStartConfig, nextConfig)
@@ -454,7 +470,7 @@ export async function processConfigChain(
 
     if (errors.length > 0) {
       throw new ThrowableDiagnostic({
-        diagnostic: errors.flatMap(e => e.diagnostics),
+        diagnostic: errors.flatMap(e => e.diagnostics ?? errorToDiagnostic(e)),
       });
     }
   }
@@ -561,7 +577,16 @@ export function validateConfigFile(
   config: RawParcelConfig | ResolvedParcelConfigFile,
   relativePath: FilePath,
 ) {
-  validateNotEmpty(config, relativePath);
+  try {
+    validateNotEmpty(config, relativePath);
+  } catch (e) {
+    throw new ThrowableDiagnostic({
+      diagnostic: {
+        message: e.message,
+        origin: '@parcel/core',
+      },
+    });
+  }
 
   validateSchema.diagnostic(
     ParcelConfigSchema,
@@ -598,6 +623,7 @@ export function mergeConfigs(
     runtimes: assertPurePipeline(mergePipelines(base.runtimes, ext.runtimes)),
     packagers: mergeMaps(base.packagers, ext.packagers),
     optimizers: mergeMaps(base.optimizers, ext.optimizers, mergePipelines),
+    compressors: mergeMaps(base.compressors, ext.compressors, mergePipelines),
     reporters: assertPurePipeline(
       mergePipelines(base.reporters, ext.reporters),
     ),

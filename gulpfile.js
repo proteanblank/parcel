@@ -2,17 +2,24 @@ const {Transform} = require('stream');
 const babel = require('gulp-babel');
 const gulp = require('gulp');
 const path = require('path');
-const rimraf = require('rimraf');
+const {rimraf} = require('rimraf');
 const babelConfig = require('./babel.config.json');
 
 const IGNORED_PACKAGES = [
   '!packages/examples/**',
   '!packages/core/integration-tests/**',
   '!packages/core/workers/test/integration/**',
-  '!packages/core/is-v2-ready-yet/**',
   '!packages/core/test-utils/**',
   '!packages/core/types/**',
-  '!packages/utils/node-libs-browser/**',
+  '!packages/core/types-internal/**',
+
+  // These packages are bundled.
+  '!packages/core/codeframe/**',
+  '!packages/core/fs/**',
+  '!packages/core/package-manager/**',
+  '!packages/core/utils/**',
+  '!packages/reporters/cli/**',
+  '!packages/reporters/dev-server/**',
 ];
 
 const paths = {
@@ -21,13 +28,13 @@ const paths = {
     '!**/dev-prelude.js',
     ...IGNORED_PACKAGES,
   ],
-  packageOther: [
-    'packages/*/*/src/**/dev-prelude.js',
-    'packages/*/dev-server/src/templates/**',
-  ],
+  packageOther: ['packages/*/*/src/**/dev-prelude.js'],
   packageJson: [
     'packages/core/parcel/package.json',
     'packages/utils/create-react-app/package.json',
+    'packages/utils/create-parcel/package.json',
+    'packages/dev/query/package.json',
+    'packages/dev/bundle-stats-cli/package.json',
   ],
   packages: 'packages/',
 };
@@ -53,7 +60,10 @@ class TapStream extends Transform {
 }
 
 exports.clean = function clean(cb) {
-  rimraf('packages/*/*/lib/**', cb);
+  rimraf('packages/*/*/lib/**').then(
+    () => cb(),
+    err => cb(err),
+  );
 };
 
 exports.default = exports.build = gulp.series(
